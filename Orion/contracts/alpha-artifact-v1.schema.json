@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.orion.sa/alpha-artifact/v1.0/schema.json",
+  "title": "Orion alpha_artifact v1.0",
+  "description": "Language-neutral engine-to-store artifact. The store owns lifecycle; engines report immutable run evidence and opaque engine JSON.",
+  "type": "object",
+  "required": [
+    "artifact_type",
+    "artifact_version",
+    "alpha_id",
+    "version",
+    "name",
+    "localized_name",
+    "localized_description",
+    "classification",
+    "provenance",
+    "metric_basis",
+    "metrics",
+    "backtest",
+    "return_series",
+    "data_quality",
+    "manifest",
+    "validation_report",
+    "data_quality_flags"
+  ],
+  "properties": {
+    "artifact_type": { "const": "alpha_artifact" },
+    "artifact_version": { "const": "1.0" },
+    "alpha_id": { "type": "string", "pattern": "^[a-z][a-z0-9_]{2,63}$" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "name": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "description": { "type": ["string", "null"] },
+    "localized_name": { "$ref": "#/$defs/localizedText" },
+    "localized_description": { "$ref": "#/$defs/localizedText" },
+    "author": { "type": ["string", "null"] },
+    "classification": { "$ref": "#/$defs/classification" },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "metric_basis": { "$ref": "#/$defs/metricBasis" },
+    "metrics": { "$ref": "#/$defs/metrics" },
+    "backtest": { "$ref": "#/$defs/backtest" },
+    "return_series": { "$ref": "#/$defs/returnSeries" },
+    "data_quality": { "$ref": "#/$defs/dataQuality" },
+    "manifest": { "$ref": "#/$defs/opaqueObject" },
+    "validation_report": {
+      "oneOf": [
+        { "$ref": "#/$defs/opaqueObject" },
+        { "type": "null" }
+      ]
+    },
+    "data_quality_flags": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+      "uniqueItems": true
+    },
+    "status": false,
+    "generated_at": false,
+    "engine_alpha_id": false,
+    "engine_alpha_version": false
+  },
+  "$defs": {
+    "localizedText": {
+      "description": "Authored human-readable copy in both product locales. Arabic is authored, not machine-translated; an artifact that cannot supply both locales is refused before submission rather than published in one language. Each locale must be written in its own script: English text in the ar slot satisfies every non-empty check and still ships an English page to an Arabic reader, so it is refused. The pattern here is a floor - at least one letter of the locale's own script, Arabic-Indic digits not counting as Arabic letters. The engine gate is stricter and requires each locale's own script to outnumber the other, which a regular expression cannot say.",
+      "type": "object",
+      "required": ["ar", "en"],
+      "properties": {
+        "ar": { "type": "string", "minLength": 1, "pattern": "[\\u0621-\\u064A]" },
+        "en": { "type": "string", "minLength": 1, "pattern": "[A-Za-z]" }
+      },
+      "additionalProperties": false
+    },
+    "classification": {
+      "type": "object",
+      "required": ["object_type", "venue", "asset_class", "family", "horizon", "direction", "rebalance"],
+      "properties": {
+        "object_type": { "enum": ["ALPHA", "INDICATOR", "RESEARCH", "UNKNOWN"] },
+        "venue": { "enum": ["TADAWUL", "US", "CRYPTO", "UNKNOWN"] },
+        "asset_class": { "enum": ["EQUITY", "ETF", "OPTION", "FUTURE", "CRYPTO", "UNKNOWN"] },
+        "family": { "enum": ["MOMENTUM", "REVERSAL", "SEASONAL", "CARRY", "VOLATILITY", "INCOME", "BREAKOUT", "OTHER", "UNKNOWN"] },
+        "horizon": { "enum": ["INTRADAY", "DAYS", "WEEKS", "MONTHS", "UNKNOWN"] },
+        "direction": { "enum": ["LONG_ONLY", "LONG_SHORT", "MARKET_NEUTRAL", "UNKNOWN"] },
+        "rebalance": { "enum": ["EACH_BAR", "DAILY_CLOSE", "WEEKLY", "MONTHLY", "UNKNOWN"] }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["source_engine", "run_type", "run_at", "run_by", "data_snapshot", "report_source"],
+      "properties": {
+        "source_engine": { "enum": ["NORDSTAR", "LEAN_QUANTCONNECT", "UNKNOWN"] },
+        "run_type": { "enum": ["ENGINE_RUN", "REPORT_INGESTED", "UNKNOWN"] },
+        "run_at": { "type": ["string", "null"], "format": "date-time" },
+        "run_by": { "type": ["string", "null"] },
+        "data_snapshot": { "type": ["string", "null"] },
+        "report_source": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "metricBasis": {
+      "type": "object",
+      "required": [
+        "currency",
+        "benchmark",
+        "risk_free_rate",
+        "risk_free_rate_unit",
+        "return_metric_unit",
+        "turnover_unit",
+        "probability_unit",
+        "return_series_unit"
+      ],
+      "properties": {
+        "currency": { "type": ["string", "null"], "pattern": "^[A-Z]{3}$" },
+        "benchmark": { "type": ["string", "null"] },
+        "risk_free_rate": { "type": ["number", "null"] },
+        "risk_free_rate_unit": { "const": "PERCENT" },
+        "return_metric_unit": { "const": "PERCENT" },
+        "turnover_unit": { "const": "MULTIPLE" },
+        "probability_unit": { "const": "PERCENT" },
+        "return_series_unit": { "const": "FRACTION" }
+      },
+      "additionalProperties": false
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["sharpe", "annual_return", "max_drawdown", "turnover", "psr", "benchmark_return"],
+      "properties": {
+        "sharpe": { "type": ["number", "null"] },
+        "annual_return": { "type": ["number", "null"] },
+        "max_drawdown": { "type": ["number", "null"] },
+        "turnover": { "type": ["number", "null"] },
+        "psr": { "type": ["number", "null"] },
+        "benchmark_return": { "type": ["number", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "backtest": {
+      "type": "object",
+      "required": ["start", "end", "min_years"],
+      "properties": {
+        "start": { "type": ["string", "null"], "format": "date" },
+        "end": { "type": ["string", "null"], "format": "date" },
+        "min_years": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "returnSeries": {
+      "type": "object",
+      "required": ["kind", "frequency", "unit", "observations"],
+      "properties": {
+        "kind": { "const": "BACKTEST" },
+        "frequency": { "const": "DAILY" },
+        "unit": { "const": "FRACTION" },
+        "observations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": ["date", "value"],
+            "properties": {
+              "date": { "type": "string", "format": "date" },
+              "value": { "type": "number" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "dataQuality": {
+      "type": "object",
+      "required": ["continuous_adjust", "max_bar_move_percent"],
+      "properties": {
+        "continuous_adjust": { "type": ["boolean", "null"] },
+        "max_bar_move_percent": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "opaqueObject": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

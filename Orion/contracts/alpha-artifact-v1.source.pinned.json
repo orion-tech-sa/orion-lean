@@ -1,0 +1,24 @@
+{
+  "contract": "alpha_artifact",
+  "artifact_version": "1.0",
+  "local_copy": "Orion/contracts/alpha-artifact-v1.schema.json",
+  "upstream": {
+    "repository": "orion-tech-sa/nordstar-engine",
+    "ref": "origin/develop",
+    "path": "contracts/alpha-artifact-v1.schema.json",
+    "commit": "c260671ce563442fbea3b2005eed8062bb364de2",
+    "blob": "396892001326d90e89aa6c217a6314c4ab8df0a4"
+  },
+  "digest": {
+    "algorithm": "sha256",
+    "normalisation": "CRLF collapsed to LF before hashing",
+    "value": "53c737f8f3cee5811515bec1989c697ca96891188ef39588ef70e7801fd91c1d"
+  },
+  "pinned_at": "2026-09-24",
+  "pinned_for": "QUANT-36",
+  "refresh": [
+    "git -C ../nordstar-engine show origin/develop:contracts/alpha-artifact-v1.schema.json > Orion/contracts/alpha-artifact-v1.schema.json",
+    "python Orion/tools/verify_contract_pin.py --repin --source Orion/contracts/alpha-artifact-v1.schema.json"
+  ],
+  "note": "Agreement with the live upstream file is a cross-repository property and cannot be a test in this repository. Orion/tools/verify_contract_pin.py checks the committed bytes against the digest above with no network and no sibling working directory; --source compares a blob an operator supplies."
+}
