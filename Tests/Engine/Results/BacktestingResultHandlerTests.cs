@@ -18,11 +18,17 @@ using NUnit.Framework;
 using QuantConnect.Algorithm.CSharp;
 using QuantConnect.Configuration;
 using QuantConnect.Lean.Engine.Results;
+using QuantConnect.Lean.Engine.TransactionHandlers;
 using QuantConnect.Logging;
+using QuantConnect.Packets;
 using QuantConnect.Report;
+using QuantConnect.Statistics;
+using QuantConnect.Tests.Engine.DataFeeds;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace QuantConnect.Tests.Engine.Results
 {
@@ -446,10 +452,10 @@ namespace QuantConnect.Tests.Engine.Results
             {
                 0,                      // First sample at start 10/7 12AM, zero because no change has occurred yet
                 0,                      // 10/7 - 10/8 <- We get first data at 12AM on 10/8
-                -0.01112113,            // 10/8 - 10/9 <- We buy at with OnMarketOpen order
-                -3.291606E-05,          // 10/9 - 10/10
-                0.01100997,             // 10/10 - 10/11
-                0.005968033             // 10/11 12AM - 10/11 8PM
+                -0.01112113,            // 10/8 - 10/9 <- We buy with a MarketOnOpen order (submitted while the market is closed)
+                0.0005122819,           // 10/9 - 10/10 <- RemoveSecurity liquidation now converts (was filling at the stale previous close)
+                0.009923037000000001,   // 10/10 - 10/11
+                0.007853915             // 10/11 12AM - 10/11 8PM
             };
 
             Assert.AreEqual(expectedPerformance, performance.Values.ToList());
@@ -463,9 +469,9 @@ namespace QuantConnect.Tests.Engine.Results
             {
                 0,                          // First sample at start 10/7 12AM, seen as missing since percent change won't exists for that day
                 0,                          // 10/7 - 10/8 <- We get first data at 12AM on 10/8
-                -0.011121126999999979,      // 10/8 - 10/9 <- We buy at with OnMarketOpen order
-                -3.29160637250732E-05,      // 10/9 - 10/10
-                0.011009966611364035,       // 10/10 - 10/11
+                -0.011121126999999979,      // 10/8 - 10/9 <- We buy with a MarketOnOpen order (submitted while the market is closed)
+                0.0005122821549045775,      // 10/9 - 10/10 <- RemoveSecurity liquidation now converts (was filling at the stale previous close)
+                0.009923037498293092,       // 10/10 - 10/11
             };
 
             Assert.AreEqual(expectedEquityPerformance, equityPerformance.ValuesAll.ToList());
@@ -545,6 +551,118 @@ namespace QuantConnect.Tests.Engine.Results
 
                 return new KeyValuePair<DateTime, double>(x.Time, value);
             }));
+        }
+
+        [Test]
+        public void RecapturesStartingPortfolioValueAfterWarmup()
+        {
+            using var api = new Api.Api();
+            using var messaging = new QuantConnect.Messaging.Messaging();
+            var resultHandler = new TestableBacktestingResultHandler();
+            resultHandler.Initialize(new(new BacktestNodePacket(), messaging, api, new BacktestingTransactionHandler(), null));
+
+            try
+            {
+                var algorithm = new AlgorithmStub();
+                algorithm.SetCash(120000);
+
+                // The setup-time snapshot: when the algorithm has a warm-up period, it is captured
+                // with currency conversion rates seeded at the warm-up start
+                resultHandler.SetAlgorithm(algorithm, 90000);
+                Assert.AreEqual(90000, resultHandler.ExposedStartingPortfolioValue);
+
+                algorithm.SetFinishedWarmingUp();
+                resultHandler.OnWarmupFinished();
+
+                // re-captured once warm-up finished, when the conversion rates are up to date
+                Assert.AreEqual(120000, resultHandler.ExposedStartingPortfolioValue);
+                Assert.AreEqual(120000, resultHandler.ExposedDailyPortfolioValue);
+                Assert.AreEqual(120000, resultHandler.ExposedCumulativeMaxPortfolioValue);
+            }
+            finally
+            {
+                resultHandler.Exit();
+            }
+        }
+
+        [Test]
+        public void InRunAnalysisRunsWhileTheAlgorithmSamplesTheCharts()
+        {
+            using var api = new Api.Api();
+            using var messaging = new QuantConnect.Messaging.Messaging();
+            var resultHandler = new TestableBacktestingResultHandler();
+            resultHandler.Initialize(new(new BacktestNodePacket(), messaging, api, new BacktestingTransactionHandler(), null));
+
+            using var sampling = new CancellationTokenSource();
+            try
+            {
+                var algorithm = new AlgorithmStub();
+                resultHandler.SetAlgorithm(algorithm, 100000);
+
+                // A margin chart large enough for the analysis to still be reading it when the next sample lands
+                var series = new Series("SPY", SeriesType.StackedArea, "%");
+                var time = new DateTime(2024, 1, 1);
+                for (var i = 0; i < 100000; i++)
+                {
+                    series.AddPoint(new ChartPoint(time.AddMinutes(i), 50));
+                }
+                var chart = new Chart(BaseResultsHandler.PortfolioMarginKey);
+                chart.AddSeries(series);
+                resultHandler.Charts[chart.Name] = chart;
+
+                // The algorithm thread samples under the chart lock. Sampling the last point again overwrites it,
+                // which keeps the chart bounded but still invalidates any enumeration of it in progress
+                var lastPoint = series.Values[^1];
+                var sampler = Task.Run(() =>
+                {
+                    while (!sampling.IsCancellationRequested)
+                    {
+                        lock (resultHandler.ExposedChartLock)
+                        {
+                            series.AddPoint(new ChartPoint(lastPoint.Time, 50));
+                        }
+                    }
+                });
+
+                // Locking the algorithm enables the handler updates
+                algorithm.SetLocked();
+                Assert.IsTrue(resultHandler.InRunAnalysisRan.Wait(TimeSpan.FromSeconds(30)), "The in-run analysis did not run");
+
+                sampling.Cancel();
+                sampler.Wait();
+                Assert.IsNotNull(resultHandler.InRunAnalysisFindings, "The in-run analysis failed, see the logged error");
+            }
+            finally
+            {
+                sampling.Cancel();
+                resultHandler.Exit();
+            }
+        }
+
+        private class TestableBacktestingResultHandler : BacktestingResultHandler
+        {
+            public decimal ExposedStartingPortfolioValue => StartingPortfolioValue;
+            public decimal ExposedDailyPortfolioValue => DailyPortfolioValue;
+            public decimal ExposedCumulativeMaxPortfolioValue => CumulativeMaxPortfolioValue;
+            public object ExposedChartLock => ChartLock;
+
+            // Store the first result, which runs the first in-run analysis, on the first update instead of 5 seconds in
+            protected override TimeSpan InitialResultStoreDelay => TimeSpan.Zero;
+
+            public ManualResetEventSlim InRunAnalysisRan { get; } = new();
+
+            /// <summary>
+            /// The findings of the first in-run analysis run, null when the analysis failed
+            /// </summary>
+            public IReadOnlyList<QuantConnect.Analysis> InRunAnalysisFindings { get; private set; }
+
+            protected override IReadOnlyList<QuantConnect.Analysis> RunInRunResultsAnalysis(BacktestResult completeResult,
+                AlgorithmPerformance totalPerformance)
+            {
+                InRunAnalysisFindings = base.RunInRunResultsAnalysis(completeResult, totalPerformance);
+                InRunAnalysisRan.Set();
+                return InRunAnalysisFindings;
+            }
         }
     }
 }

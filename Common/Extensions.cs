@@ -80,6 +80,18 @@ namespace QuantConnect
             = new Dictionary<IntPtr, PythonActivator>();
 
         /// <summary>
+        /// Prefixes the given message with the provided algorithm time, producing the standard
+        /// timestamped format shared by algorithm logs and messages
+        /// </summary>
+        /// <param name="message">The message to prefix</param>
+        /// <param name="algorithmTime">The algorithm time to prefix the message with</param>
+        /// <returns>The message prefixed with the algorithm time</returns>
+        public static string PrefixWithAlgorithmTime(this string message, DateTime algorithmTime)
+        {
+            return $"{algorithmTime.ToStringInvariant(DateFormat.UI)} {message}";
+        }
+
+        /// <summary>
         /// Maintains old behavior of NodaTime's (&lt; 2.0) daylight savings mapping.
         /// We keep the old behavior to ensure the FillForwardEnumerator does not get stuck on an infinite loop.
         /// The test `ConvertToSkipsDiscontinuitiesBecauseOfDaylightSavingsStart_AddingOneHour` and other related tests
@@ -2863,7 +2875,8 @@ namespace QuantConnect
                 order.Time,
                 order.Tag,
                 order.Properties,
-                order.GroupOrderManager);
+                order.GroupOrderManager,
+                contingency: order.Contingency);
 
             submitOrderRequest.SetOrderId(order.Id);
             var orderTicket = new OrderTicket(transactionManager, submitOrderRequest);
@@ -3025,6 +3038,20 @@ namespace QuantConnect
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// Gets a string representation of the given Python object and its type
+        /// to be used in user-facing messages, e.g. "'Daily' of type 'Resolution'"
+        /// </summary>
+        /// <param name="pyObject">The Python object to represent</param>
+        /// <returns>The string representation of the Python object</returns>
+        public static string ToDisplayString(this PyObject pyObject)
+        {
+            using (Py.GIL())
+            {
+                return $"'{pyObject}' of type '{pyObject.GetPythonType().Name}'";
+            }
         }
 
         /// <summary>
@@ -3921,9 +3948,7 @@ namespace QuantConnect
             switch (securityType)
             {
                 case SecurityType.Future:
-                    if ((universeSettings.DataMappingMode == DataMappingMode.OpenInterest
-                        || universeSettings.DataMappingMode == DataMappingMode.OpenInterestAnnual)
-                        && (market == Market.HKFE || market == Market.EUREX || market == Market.ICE))
+                    if (!universeSettings.DataMappingMode.IsAvailableForFutureMarket(market))
                     {
                         // circle around default OI for currently no OI available data
                         return DataMappingMode.LastTradingDay;
@@ -3932,6 +3957,15 @@ namespace QuantConnect
                 default:
                     return universeSettings.DataMappingMode;
             }
+        }
+
+        /// <summary>
+        /// Determines whether there is mapping data for the given data mapping mode in the given future market
+        /// </summary>
+        public static bool IsAvailableForFutureMarket(this DataMappingMode dataMappingMode, string market)
+        {
+            return dataMappingMode != DataMappingMode.OpenInterest && dataMappingMode != DataMappingMode.OpenInterestAnnual
+                || market != Market.HKFE && market != Market.EUREX && market != Market.ICE && market != Market.KRX;
         }
 
         /// <summary>

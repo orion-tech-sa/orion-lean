@@ -17,6 +17,7 @@ using System;
 using System.Linq;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using System.Collections.Generic;
 using QuantConnect.Brokerages;
 using QuantConnect.Securities;
 
@@ -118,9 +119,9 @@ namespace QuantConnect.Orders
             var orderSubmissionData = jObject["OrderSubmissionData"] ?? jObject["orderSubmissionData"];
             if (orderSubmissionData != null && orderSubmissionData.Type != JTokenType.Null)
             {
-                var bidPrice = orderSubmissionData["BidPrice"]?.Value<decimal>() ?? orderSubmissionData["bidPrice"].Value<decimal>();
-                var askPrice = orderSubmissionData["AskPrice"]?.Value<decimal>() ?? orderSubmissionData["askPrice"].Value<decimal>();
-                var lastPrice = orderSubmissionData["LastPrice"]?.Value<decimal>() ?? orderSubmissionData["lastPrice"].Value<decimal>();
+                var bidPrice = SafeDecimalValue(orderSubmissionData["BidPrice"] ?? orderSubmissionData["bidPrice"]);
+                var askPrice = SafeDecimalValue(orderSubmissionData["AskPrice"] ?? orderSubmissionData["askPrice"]);
+                var lastPrice = SafeDecimalValue(orderSubmissionData["LastPrice"] ?? orderSubmissionData["lastPrice"]);
                 order.OrderSubmissionData = new OrderSubmissionData(bidPrice, askPrice, lastPrice);
             }
 
@@ -157,11 +158,11 @@ namespace QuantConnect.Orders
                 order.Tag = string.Empty;
             }
 
-            order.Quantity = jObject["Quantity"]?.Value<decimal>() ?? jObject["quantity"].Value<decimal>();
+            order.Quantity = SafeDecimalValue(jObject["Quantity"] ?? jObject["quantity"]);
             var orderPrice = jObject["Price"] ?? jObject["price"];
             if (orderPrice != null && orderPrice.Type != JTokenType.Null)
             {
-                order.Price = orderPrice.Value<decimal>();
+                order.Price = SafeDecimalValue(orderPrice);
             }
             else
             {
@@ -179,6 +180,8 @@ namespace QuantConnect.Orders
             {
                 order.ContingentId = jsonContingentId.Value<int>();
             }
+
+            DeserializeContingency(jObject, order);
 
             var timeInForce = jObject["Properties"]?["TimeInForce"] ?? jObject["TimeInForce"] ?? jObject["Duration"];
             if (timeInForce == null)
@@ -256,29 +259,31 @@ namespace QuantConnect.Orders
                     break;
 
                 case OrderType.Limit:
-                    order = new LimitOrder { LimitPrice = jObject["LimitPrice"]?.Value<decimal>() ?? jObject["limitPrice"]?.Value<decimal>() ?? default(decimal) };
+                    order = new LimitOrder { LimitPrice = SafeDecimalValueOrDefault(jObject["LimitPrice"] ?? jObject["limitPrice"]) };
                     break;
 
                 case OrderType.StopMarket:
                     order = new StopMarketOrder
                     {
-                        StopPrice = jObject["stopPrice"]?.Value<decimal>() ?? jObject["StopPrice"]?.Value<decimal>() ?? default(decimal)
+                        StopPrice = SafeDecimalValueOrDefault(jObject["stopPrice"] ?? jObject["StopPrice"])
                     };
                     break;
 
                 case OrderType.StopLimit:
                     order = new StopLimitOrder
                     {
-                        LimitPrice = jObject["LimitPrice"]?.Value<decimal>() ?? jObject["limitPrice"]?.Value<decimal>() ?? default(decimal),
-                        StopPrice = jObject["stopPrice"]?.Value<decimal>() ?? jObject["StopPrice"]?.Value<decimal>() ?? default(decimal)
+                        LimitPrice = SafeDecimalValueOrDefault(jObject["LimitPrice"] ?? jObject["limitPrice"]),
+                        StopPrice = SafeDecimalValueOrDefault(jObject["stopPrice"] ?? jObject["StopPrice"]),
+                        StopTriggered = jObject["StopTriggered"]?.Value<bool>() ?? jObject["stopTriggered"]?.Value<bool>() ?? default(bool),
+                        StopTriggeredTime = jObject["StopTriggeredTime"]?.Value<DateTime?>() ?? jObject["stopTriggeredTime"]?.Value<DateTime?>()
                     };
                     break;
 
                 case OrderType.TrailingStop:
                     order = new TrailingStopOrder
                     {
-                        StopPrice = jObject["StopPrice"]?.Value<decimal>() ?? jObject["stopPrice"]?.Value<decimal>() ?? default(decimal),
-                        TrailingAmount = jObject["TrailingAmount"]?.Value<decimal>() ?? jObject["trailingAmount"]?.Value<decimal>() ??  default(decimal),
+                        StopPrice = SafeDecimalValueOrDefault(jObject["StopPrice"] ?? jObject["stopPrice"]),
+                        TrailingAmount = SafeDecimalValueOrDefault(jObject["TrailingAmount"] ?? jObject["trailingAmount"]),
                         TrailingAsPercentage = jObject["TrailingAsPercentage"]?.Value<bool>() ?? jObject["trailingAsPercentage"]?.Value<bool>() ?? default(bool)
                     };
                     break;
@@ -286,8 +291,9 @@ namespace QuantConnect.Orders
                 case OrderType.LimitIfTouched:
                     order = new LimitIfTouchedOrder
                     {
-                        LimitPrice = jObject["LimitPrice"]?.Value<decimal>() ?? jObject["limitPrice"]?.Value<decimal>() ?? default(decimal),
-                        TriggerPrice = jObject["TriggerPrice"]?.Value<decimal>() ?? jObject["triggerPrice"]?.Value<decimal>() ?? default(decimal)
+                        LimitPrice = SafeDecimalValueOrDefault(jObject["LimitPrice"] ?? jObject["limitPrice"]),
+                        TriggerPrice = SafeDecimalValueOrDefault(jObject["TriggerPrice"] ?? jObject["triggerPrice"]),
+                        TriggerTouched = jObject["TriggerTouched"]?.Value<bool>() ?? jObject["triggerTouched"]?.Value<bool>() ?? default(bool)
                     };
                     break;
 
@@ -315,7 +321,7 @@ namespace QuantConnect.Orders
                     order = new ComboLegLimitOrder
                     {
                         GroupOrderManager = DeserializeGroupOrderManager(jObject),
-                        LimitPrice = jObject["LimitPrice"]?.Value<decimal>() ?? jObject["limitPrice"]?.Value<decimal>() ?? default(decimal)
+                        LimitPrice = SafeDecimalValueOrDefault(jObject["LimitPrice"] ?? jObject["limitPrice"])
                     };
                     break;
 
@@ -372,8 +378,8 @@ namespace QuantConnect.Orders
             var result = new GroupOrderManager(
                 groupOrderManagerJObject["Id"]?.Value<int>() ?? groupOrderManagerJObject["id"].Value<int>(),
                 groupOrderManagerJObject["Count"]?.Value<int>() ?? groupOrderManagerJObject["count"].Value<int>(),
-                groupOrderManagerJObject["Quantity"]?.Value<decimal>() ?? groupOrderManagerJObject["quantity"].Value<decimal>(),
-                groupOrderManagerJObject["LimitPrice"]?.Value<decimal>() ?? groupOrderManagerJObject["limitPrice"].Value<decimal>()
+                SafeDecimalValue(groupOrderManagerJObject["Quantity"] ?? groupOrderManagerJObject["quantity"]),
+                SafeDecimalValue(groupOrderManagerJObject["LimitPrice"] ?? groupOrderManagerJObject["limitPrice"])
             );
 
             foreach (var orderId in (groupOrderManagerJObject["OrderIds"]?.Values<int>() ?? groupOrderManagerJObject["orderIds"].Values<int>()))
@@ -382,6 +388,79 @@ namespace QuantConnect.Orders
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Deserializes the contingency of the order from the JSON object, if any, available for any order type
+        /// </summary>
+        private static void DeserializeContingency(JObject jObject, Order order)
+        {
+            var contingencyToken = jObject["Contingency"] ?? jObject["contingency"];
+            if (contingencyToken == null || contingencyToken.Type != JTokenType.Object)
+            {
+                // not a contingent order, or an order serialized before they existed
+                return;
+            }
+            var linksToken = contingencyToken["Links"] ?? contingencyToken["links"];
+            var count = (contingencyToken["Count"] ?? contingencyToken["count"])?.Value<int>() ?? 0;
+            if (linksToken == null || linksToken.Type != JTokenType.Array || count < 1)
+            {
+                return;
+            }
+
+            var links = new List<ContingencyLink>();
+            foreach (var token in linksToken)
+            {
+                if (token.Type != JTokenType.Object)
+                {
+                    continue;
+                }
+                var type = (ContingencyType)((token["Type"] ?? token["type"])?.Value<int>() ?? 0);
+                var roleToken = token["Role"] ?? token["role"];
+                var role = roleToken != null && roleToken.Type != JTokenType.Null ? (ContingencyRole?)roleToken.Value<int>() : null;
+                if (!ContingencyLink.IsValidRole(type, role))
+                {
+                    continue;
+                }
+                var triggeredTime = token["TriggeredTime"] ?? token["triggeredTime"];
+                links.Add(new ContingencyLink(
+                    (token["Id"] ?? token["id"])?.Value<int>() ?? 0,
+                    type,
+                    role,
+                    (token["Triggered"] ?? token["triggered"])?.Value<bool>() ?? false,
+                    triggeredTime != null && triggeredTime.Type != JTokenType.Null ? triggeredTime.Value<DateTime>() : null));
+            }
+
+            var contingency = new OrderContingency((contingencyToken["Id"] ?? contingencyToken["id"])?.Value<int>() ?? 0, count, links);
+            var orderIds = contingencyToken["OrderIds"] ?? contingencyToken["orderIds"];
+            if (orderIds != null && orderIds.Type == JTokenType.Array)
+            {
+                contingency.OrderIds.UnionWith(orderIds.Values<int>());
+            }
+            order.Contingency = contingency;
+        }
+
+        /// <summary>
+        /// Gets the decimal value of the given token, clamping it to the decimal range when the token holds
+        /// a double too large or too small to be represented as a decimal. Values at the edge of the range,
+        /// like a quantity clamped to <see cref="decimal.MaxValue"/> by <see cref="Extensions.SafeDecimalCast"/>,
+        /// are parsed back from JSON as doubles that round past the decimal range
+        /// </summary>
+        private static decimal SafeDecimalValue(JToken token)
+        {
+            if (token is JValue { Value: double value })
+            {
+                return value.SafeDecimalCast();
+            }
+            return token.Value<decimal>();
+        }
+
+        /// <summary>
+        /// Gets the decimal value of the given token, or zero if the token is null
+        /// </summary>
+        private static decimal SafeDecimalValueOrDefault(JToken token)
+        {
+            return token == null ? default : SafeDecimalValue(token);
         }
     }
 }

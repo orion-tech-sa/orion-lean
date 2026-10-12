@@ -16,6 +16,7 @@
 
 using System;
 using System.Linq;
+using QuantConnect.Interfaces;
 using QuantConnect.Orders;
 using QuantConnect.Securities;
 using System.Collections.Generic;
@@ -36,6 +37,91 @@ namespace QuantConnect.Brokerages
             OrderType.MarketOnOpen,
             OrderType.MarketOnClose
         };
+
+        /// <summary>
+        /// Rejects contingent orders (OCO, OTO, OUO, brackets), for the brokerage models of brokerages which don't support them
+        /// </summary>
+        /// <param name="brokerageModel">The brokerage model</param>
+        /// <param name="order">The order to validate</param>
+        /// <param name="message">If this function returns false, a brokerage message detailing why the order may not be submitted</param>
+        /// <returns>False if the order is a contingent order</returns>
+        public static bool ValidateContingentOrdersNotSupported(this IBrokerageModel brokerageModel, Order order, out BrokerageMessageEvent message)
+        {
+            message = null;
+            if (order.Contingency == null)
+            {
+                return true;
+            }
+
+            message = new BrokerageMessageEvent(BrokerageMessageType.Warning, "NotSupported",
+                Messages.DefaultBrokerageModel.UnsupportedContingentOrders(brokerageModel));
+            return false;
+        }
+
+        /// <summary>
+        /// Validates the contingencies of the given order are of a type supported by the brokerage
+        /// </summary>
+        /// <param name="brokerageModel">The brokerage model</param>
+        /// <param name="order">The order to validate</param>
+        /// <param name="supportedContingencyTypes">The contingency types supported by the brokerage</param>
+        /// <param name="message">If this function returns false, a brokerage message detailing why the order may not be submitted</param>
+        /// <param name="supportsComboOrders">True if combo orders can be part of a set of contingent orders</param>
+        /// <param name="supportsMultipleSymbols">True if the orders in the set can be for different symbols</param>
+        /// <param name="supportsNesting">True if an order triggered by another can trigger others in turn</param>
+        /// <param name="maximumOrderCount">The maximum number of orders in the set</param>
+        /// <returns>True if the order is not a contingent order or all its contingencies are supported</returns>
+        public static bool ValidateContingentOrder(this IBrokerageModel brokerageModel, Order order,
+            IReadOnlySet<ContingencyType> supportedContingencyTypes, out BrokerageMessageEvent message,
+            bool supportsComboOrders = true, bool supportsMultipleSymbols = true, bool supportsNesting = true, int maximumOrderCount = int.MaxValue)
+        {
+            message = null;
+            var contingency = order.Contingency;
+            if (contingency == null)
+            {
+                return true;
+            }
+
+            var isParent = false;
+            var isChild = false;
+            foreach (var link in contingency.Links)
+            {
+                if (!supportedContingencyTypes.Contains(link.Type))
+                {
+                    message = new BrokerageMessageEvent(BrokerageMessageType.Warning, "NotSupported",
+                        Messages.DefaultBrokerageModel.UnsupportedContingencyType(brokerageModel, link.Type, supportedContingencyTypes));
+                    return false;
+                }
+                isParent |= link.Role == ContingencyRole.Parent;
+                isChild |= link.Role == ContingencyRole.Child;
+            }
+
+            if (!supportsComboOrders && order.GroupOrderManager != null)
+            {
+                message = brokerageModel.UnsupportedContingentOrdersShape("combo orders are not supported.");
+            }
+            else if (!supportsMultipleSymbols && contingency.Symbols.Count > 1)
+            {
+                message = brokerageModel.UnsupportedContingentOrdersShape("all the orders have to be for the same symbol.");
+            }
+            else if (!supportsNesting && isParent && isChild)
+            {
+                message = brokerageModel.UnsupportedContingentOrdersShape("an order triggered by another can not trigger other orders in turn.");
+            }
+            else if (contingency.Count > maximumOrderCount)
+            {
+                message = brokerageModel.UnsupportedContingentOrdersShape($"the maximum number of orders is {maximumOrderCount.ToStringInvariant()}.");
+            }
+            return message == null;
+        }
+
+        /// <summary>
+        /// Helper to create the message of a set of contingent orders with a shape not supported by the brokerage
+        /// </summary>
+        public static BrokerageMessageEvent UnsupportedContingentOrdersShape(this IBrokerageModel brokerageModel, string reason)
+        {
+            return new BrokerageMessageEvent(BrokerageMessageType.Warning, "NotSupported",
+                Messages.DefaultBrokerageModel.UnsupportedContingentOrdersShape(brokerageModel, reason));
+        }
 
         /// <summary>
         /// Determines if executing the specified order will cross the zero holdings threshold.
@@ -183,6 +269,71 @@ namespace QuantConnect.Brokerages
                 OrderDirection.Sell => holdingsQuantity <= 0 ? OrderPosition.SellToOpen : OrderPosition.SellToClose,
                 _ => throw new ArgumentOutOfRangeException(nameof(orderDirection), orderDirection, "Invalid order direction")
             };
+        }
+
+        /// <summary>
+        /// Removes the locate from an order that does not open a short position.
+        /// A locate belongs only on short sells; brokers reject it on any other order.
+        /// A position side set in the properties wins over the holdings check.
+        /// The edit goes into a copy; the given instance is never touched.
+        /// </summary>
+        /// <param name="properties">The order properties to check</param>
+        /// <param name="quantity">The order quantity; the sign gives the order direction</param>
+        /// <param name="holdingsQuantity">The current holdings quantity</param>
+        /// <returns>A copy of the properties without the locate; null when there is nothing to remove</returns>
+        public static IOrderProperties RemoveLocateFromNonShortOrder(IOrderProperties properties, decimal quantity, decimal holdingsQuantity)
+        {
+            switch (properties)
+            {
+                case TerminalLinkOrderProperties terminalLink:
+                    if ((string.IsNullOrEmpty(terminalLink.LocateBroker) && string.IsNullOrEmpty(terminalLink.LocateId))
+                        || IsShortOpen(terminalLink.PositionSide, quantity, holdingsQuantity))
+                    {
+                        return null;
+                    }
+                    var terminalLinkCopy = (TerminalLinkOrderProperties)terminalLink.Clone();
+                    terminalLinkCopy.LocateBroker = null;
+                    terminalLinkCopy.LocateId = null;
+                    return terminalLinkCopy;
+
+                case WolverineOrderProperties wolverine:
+                    if (string.IsNullOrEmpty(wolverine.LocateBroker) || IsShortOpen(wolverine.PositionSide, quantity, holdingsQuantity))
+                    {
+                        return null;
+                    }
+                    var wolverineCopy = (WolverineOrderProperties)wolverine.Clone();
+                    wolverineCopy.LocateBroker = null;
+                    return wolverineCopy;
+
+                case BloombergFixOrderProperties bloombergFix:
+                    if ((string.IsNullOrEmpty(bloombergFix.LocateBroker) && string.IsNullOrEmpty(bloombergFix.LocateReqd))
+                        || IsShortOpen(bloombergFix.PositionSide, quantity, holdingsQuantity))
+                    {
+                        return null;
+                    }
+                    var bloombergFixCopy = (BloombergFixOrderProperties)bloombergFix.Clone();
+                    bloombergFixCopy.LocateBroker = null;
+                    bloombergFixCopy.LocateReqd = null;
+                    return bloombergFixCopy;
+
+                default:
+                    return null;
+            }
+        }
+
+        /// <summary>
+        /// Whether the order opens a short position. A position side set in the order properties
+        /// wins over the holdings-based mapping.
+        /// </summary>
+        private static bool IsShortOpen(OrderPosition? positionSide, decimal quantity, decimal holdingsQuantity)
+        {
+            if (positionSide.HasValue)
+            {
+                return positionSide.Value == OrderPosition.SellToOpen;
+            }
+
+            // A sell that ends below zero opens a short, cross-zero sells included
+            return Extensions.GetOrderDirection(quantity) == OrderDirection.Sell && holdingsQuantity + quantity < 0;
         }
     }
 }

@@ -107,6 +107,8 @@ namespace QuantConnect.Algorithm
         private bool _tagsLimitReachedLogSent;
         private bool _tagsCollectionTruncatedLogSent;
         private bool _hasShownDailyConsolidationWarning;
+        private bool _optionUnderlyingResolutionWarningSent;
+        private bool _indexOptionTickerAsUnderlyingWarningSent;
         private DateTime _start;
         private DateTime _startDate;   //Default start and end dates.
         private DateTime _endDate;     //Default end to yesterday
@@ -119,6 +121,8 @@ namespace QuantConnect.Algorithm
         private ConcurrentQueue<string> _logMessages = new ConcurrentQueue<string>();
         private ConcurrentQueue<string> _errorMessages = new ConcurrentQueue<string>();
         private IStatisticsService _statisticsService;
+        // summary statistics set before the statistics service is attached, e.g. during Initialize
+        private Dictionary<string, string> _pendingSummaryStatistics;
         private IBrokerageModel _brokerageModel;
 
         private bool _sentBroadcastCommandsDisabled;
@@ -150,6 +154,9 @@ namespace QuantConnect.Algorithm
         private TimeSpan? _warmupTimeSpan;
         private int? _warmupBarCount;
         private Dictionary<string, string> _parameters = new Dictionary<string, string>();
+        private bool _deploymentDetailsSet;
+        private readonly HashSet<string> _dataMappingModeFallbackWarnedMarkets = new();
+        private bool _ignoredContinuousFutureSettingsWarningSent;
         private SecurityDefinitionSymbolResolver _securityDefinitionSymbolResolver;
 
         private SecurityDefinitionSymbolResolver SecurityDefinitionSymbolResolver
@@ -205,6 +212,7 @@ namespace QuantConnect.Algorithm
 
             Securities = new SecurityManager(_timeKeeper);
             Transactions = new SecurityTransactionManager(this, Securities);
+            OrderFactory = new OrderFactory(this);
             Portfolio = new SecurityPortfolioManager(Securities, Transactions, Settings, DefaultOrderProperties);
             SignalExport = new SignalExportManager(this);
 
@@ -747,6 +755,13 @@ namespace QuantConnect.Algorithm
         public ObjectStore ObjectStore { get; private set; }
 
         /// <summary>
+        /// Gets a read-only view of the deployment details shared by the brokerage, data queue handler or any other component,
+        /// for example account information. Usually empty when not running in live mode
+        /// </summary>
+        [DocumentationAttribute(LiveTrading)]
+        public ReadOnlyExtendedDictionary<string, string> DeploymentDetails { get; private set; } = new();
+
+        /// <summary>
         /// The current statistics for the running algorithm.
         /// </summary>
         [DocumentationAttribute(StatisticsTag)]
@@ -914,6 +929,25 @@ namespace QuantConnect.Algorithm
         public ReadOnlyExtendedDictionary<string, string> GetParameters()
         {
             return _parameters.ToReadOnlyExtendedDictionary();
+        }
+
+        /// <summary>
+        /// Sets the deployment details read-only view. Can only be set once, it's shared by the engine
+        /// </summary>
+        /// <param name="deploymentDetails">The deployment details</param>
+        [DocumentationAttribute(LiveTrading)]
+        public void SetDeploymentDetails(ReadOnlyExtendedDictionary<string, string> deploymentDetails)
+        {
+            if (deploymentDetails == null)
+            {
+                throw new ArgumentNullException(nameof(deploymentDetails));
+            }
+            if (_deploymentDetailsSet && !ReferenceEquals(DeploymentDetails, deploymentDetails))
+            {
+                throw new InvalidOperationException("QCAlgorithm.SetDeploymentDetails(): the deployment details have already been set, they can only be set once");
+            }
+            DeploymentDetails = deploymentDetails;
+            _deploymentDetailsSet = true;
         }
 
         /// <summary>
@@ -1495,7 +1529,7 @@ namespace QuantConnect.Algorithm
         /// <summary>
         /// Sets the benchmark used for computing statistics of the algorithm to the specified symbol
         /// </summary>
-        /// <param name="symbol">symbol to use as the benchmark</param>
+        /// <param name="symbol">symbol to use as the benchmark, null to disable the benchmark</param>
         [DocumentationAttribute(TradingAndOrders)]
         [DocumentationAttribute(SecuritiesAndPortfolio)]
         [DocumentationAttribute(Indicators)]
@@ -1504,6 +1538,13 @@ namespace QuantConnect.Algorithm
             if (_locked)
             {
                 throw new InvalidOperationException(Messages.QCAlgorithm.SetBenchmarkAlreadyInitialized());
+            }
+
+            if (symbol == null)
+            {
+                // Equivalent to no benchmark
+                Benchmark = new FuncBenchmark(_ => 0);
+                return;
             }
 
             // Create our security benchmark
@@ -2073,7 +2114,7 @@ namespace QuantConnect.Algorithm
                         {
                             ExtendedMarketHours = extendedMarketHours.Value,
                             FillForward = fillForward.Value,
-                            DataMappingMode = dataMappingMode ?? UniverseSettings.GetUniverseMappingModeOrDefault(symbol.SecurityType, symbol.ID.Market),
+                            DataMappingMode = GetDataMappingModeOrDefault(symbol, dataMappingMode),
                             DataNormalizationMode = dataNormalizationMode ?? UniverseSettings.GetUniverseNormalizationModeOrDefault(symbol.SecurityType),
                             ContractDepthOffset = (int)contractOffset,
                             SubscriptionDataTypes = dataTypes,
@@ -2098,10 +2139,71 @@ namespace QuantConnect.Algorithm
 
                     AddUniverse(universe);
                 }
+                else if (symbol.SecurityType == SecurityType.Future
+                    && UniverseManager.TryGetValue(ContinuousContractUniverse.CreateSymbol(symbol), out var continuousUniverse))
+                {
+                    var requestedDataMappingMode = dataMappingMode.HasValue ? GetDataMappingModeOrDefault(symbol, dataMappingMode) : (DataMappingMode?)null;
+                    WarnIfContinuousFutureSettingsIgnored(symbol, continuousUniverse.UniverseSettings, requestedDataMappingMode, dataNormalizationMode, (int)contractOffset);
+                }
                 return security;
             }
 
             return AddToUserDefinedUniverse(security, configs);
+        }
+
+        /// <summary>
+        /// Gets the requested or default data mapping mode for the given symbol, falling back to the market default if it is not available,
+        /// warning once per market when it does
+        /// </summary>
+        private DataMappingMode GetDataMappingModeOrDefault(Symbol symbol, DataMappingMode? dataMappingMode = null)
+        {
+            var requestedDataMappingMode = dataMappingMode ?? UniverseSettings.DataMappingMode;
+            if (symbol.SecurityType != SecurityType.Future || !symbol.IsCanonical() || requestedDataMappingMode.IsAvailableForFutureMarket(symbol.ID.Market))
+            {
+                return requestedDataMappingMode;
+            }
+
+            var fallbackDataMappingMode = UniverseSettings.GetUniverseMappingModeOrDefault(symbol.SecurityType, symbol.ID.Market);
+            if (_dataMappingModeFallbackWarnedMarkets.Add(symbol.ID.Market))
+            {
+                Debug($"Warning: {requestedDataMappingMode} data mapping mode is not available for {symbol.ID.Market.ToUpperInvariant()} futures, using {fallbackDataMappingMode} instead.");
+            }
+            return fallbackDataMappingMode;
+        }
+
+        /// <summary>
+        /// Warns once if a future is added again with continuous contract settings that differ from the existing ones, which are kept
+        /// </summary>
+        private void WarnIfContinuousFutureSettingsIgnored(Symbol symbol, UniverseSettings existingSettings, DataMappingMode? dataMappingMode,
+            DataNormalizationMode? dataNormalizationMode, int contractDepthOffset)
+        {
+            if (_ignoredContinuousFutureSettingsWarningSent)
+            {
+                return;
+            }
+
+            var ignoredSettings = new List<string>();
+            if (dataMappingMode.HasValue && dataMappingMode != existingSettings.DataMappingMode)
+            {
+                ignoredSettings.Add($"data mapping mode {dataMappingMode}");
+            }
+            if (dataNormalizationMode.HasValue && dataNormalizationMode != existingSettings.DataNormalizationMode)
+            {
+                ignoredSettings.Add($"normalization mode {dataNormalizationMode}");
+            }
+            if (contractDepthOffset != existingSettings.ContractDepthOffset)
+            {
+                ignoredSettings.Add($"contract depth offset {contractDepthOffset}");
+            }
+
+            if (ignoredSettings.Count > 0)
+            {
+                _ignoredContinuousFutureSettingsWarningSent = true;
+                var instructions = _locked
+                    ? "Remove it first to change its settings."
+                    : "Add it once, or remove and re-add it after Initialize.";
+                Debug($"Warning: {symbol} already added, ignoring {string.Join(", ", ignoredSettings)}. {instructions}");
+            }
         }
 
         /// <summary>
@@ -2196,6 +2298,9 @@ namespace QuantConnect.Algorithm
             {
                 canonicalSymbol = QuantConnect.Symbol.CreateCanonicalOption(underlying, targetOption, market, alias);
             }
+
+            WarnIfUnderlyingResolutionIsCoarser(canonicalSymbol,
+                SubscriptionManager.SubscriptionDataConfigService.GetSubscriptionDataConfigs(underlying), resolution);
 
             return (Option)AddSecurity(canonicalSymbol, resolution, fillForward, leverage);
         }
@@ -2309,7 +2414,24 @@ namespace QuantConnect.Algorithm
 
         public IndexOption AddIndexOption(string underlying, Resolution? resolution = null, string market = null, bool fillForward = true)
         {
-            return AddIndexOption(underlying, null, resolution, market, fillForward);
+            string targetOption = null;
+            // Some non-standard index options, like the weekly SPXW, are options on an index (SPX) but have their own ticker.
+            // If one of those option tickers is provided as the underlying, e.g. AddIndexOption("SPXW"), map it to the
+            // actual underlying index and use the provided ticker as the target option. Otherwise a data-less index security
+            // would be created and used as the underlying of the option contracts, which would never get a price
+            var underlyingTicker = IndexOptionSymbol.MapToUnderlying(underlying);
+            if (!underlyingTicker.Equals(underlying, StringComparison.InvariantCultureIgnoreCase))
+            {
+                if (!_indexOptionTickerAsUnderlyingWarningSent)
+                {
+                    _indexOptionTickerAsUnderlyingWarningSent = true;
+                    Debug($"Warning: '{underlying}' is an index option ticker, using index '{underlyingTicker}' as the underlying and '{underlying}' as the target option.");
+                }
+                targetOption = underlying;
+                underlying = underlyingTicker;
+            }
+
+            return AddIndexOption(underlying, targetOption, resolution, market, fillForward);
         }
 
         /// <summary>
@@ -2381,6 +2503,26 @@ namespace QuantConnect.Algorithm
         }
 
         /// <summary>
+        /// Warns once if the option resolution is finer than the existing underlying subscription,
+        /// since the option pricing models would then use a stale underlying price
+        /// </summary>
+        private void WarnIfUnderlyingResolutionIsCoarser(Symbol option, List<SubscriptionDataConfig> underlyingConfigs, Resolution? optionResolution)
+        {
+            if (_optionUnderlyingResolutionWarningSent || underlyingConfigs.Count == 0)
+            {
+                return;
+            }
+
+            var resolution = optionResolution ?? UniverseSettings.Resolution;
+            var underlyingResolution = underlyingConfigs.GetHighestResolution();
+            if (underlyingResolution > resolution)
+            {
+                Debug($"Warning: {Messages.QCAlgorithm.OptionUnderlyingResolutionIsCoarser(option, resolution, underlyingResolution)}");
+                _optionUnderlyingResolutionWarningSent = true;
+            }
+        }
+
+        /// <summary>
         /// Creates and adds a new single <see cref="Option"/> contract to the algorithm
         /// </summary>
         /// <param name="symbol">The option contract symbol</param>
@@ -2435,6 +2577,8 @@ namespace QuantConnect.Algorithm
                     }
                 }
             }
+
+            WarnIfUnderlyingResolutionIsCoarser(symbol, underlyingConfigs, resolution);
 
             var configs = SubscriptionManager.SubscriptionDataConfigService.Add(symbol, resolution, fillForward, extendedMarketHours,
                 dataNormalizationMode: DataNormalizationMode.Raw);
@@ -3442,7 +3586,8 @@ namespace QuantConnect.Algorithm
             foreach (var (symbol, contracts) in optionChainsData)
             {
                 var symbolProperties = SymbolPropertiesDatabase.GetSymbolProperties(symbol.ID.Market, symbol, symbol.SecurityType, AccountCurrency);
-                var optionChain = new OptionChain(symbol, GetTimeInExchangeTimeZone(symbol).Date, contracts, symbolProperties, flatten);
+                var exchangeHours = MarketHoursDatabase.GetExchangeHours(symbol.ID.Market, symbol, symbol.SecurityType);
+                var optionChain = new OptionChain(symbol, UtcTime.ConvertFromUtc(exchangeHours.TimeZone).Date, contracts, symbolProperties, exchangeHours, flatten);
                 chains.Add(symbol, optionChain);
             }
 
@@ -3778,6 +3923,15 @@ namespace QuantConnect.Algorithm
             if (_statisticsService == null)
             {
                 _statisticsService = statisticsService;
+
+                if (_pendingSummaryStatistics != null)
+                {
+                    foreach (var (name, value) in _pendingSummaryStatistics)
+                    {
+                        _statisticsService.SetSummaryStatistic(name, value);
+                    }
+                    _pendingSummaryStatistics = null;
+                }
             }
         }
 
@@ -3817,7 +3971,7 @@ namespace QuantConnect.Algorithm
 
         private string FormatLog(string message)
         {
-            return $"{Time.ToStringInvariant(DateFormat.UI)} {message}";
+            return message.PrefixWithAlgorithmTime(Time);
         }
     }
 }

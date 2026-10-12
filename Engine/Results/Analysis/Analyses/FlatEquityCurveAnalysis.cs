@@ -25,6 +25,11 @@ namespace QuantConnect.Lean.Engine.Results.Analysis.Analyses
     public class FlatEquityCurveAnalysis : BaseResultsAnalysis
     {
         /// <summary>
+        /// This analysis scans the equity curve, which is only built for the final analysis.
+        /// </summary>
+        public override bool RunsInRun { get; } = false;
+
+        /// <summary>
         /// Gets the description of the flat equity curve issue.
         /// </summary>
         public override string Issue { get; } = "The equity curve is flat for several days in a row.";
@@ -33,6 +38,12 @@ namespace QuantConnect.Lean.Engine.Results.Analysis.Analyses
         /// Gets the severity weight for the flat equity curve analysis.
         /// </summary>
         public override int Weight { get; } = 99;
+
+        /// <summary>
+        /// Maximum number of flat segments included in the sample. When more are found,
+        /// only the longest ones are kept and the total count is reported in the result.
+        /// </summary>
+        private const int MaxReportedSegments = 5;
 
         /// <summary>
         /// Runs the flat equity curve analysis against the provided backtest parameters.
@@ -50,7 +61,7 @@ namespace QuantConnect.Lean.Engine.Results.Analysis.Analyses
             var keys = equityCurve.Keys.ToArray();
             var vals = equityCurve.Values.ToArray();
 
-            var segments = new List<object>();
+            var segments = new List<(DateTime start, DateTime end, int tradingDays)>();
             var i = 0;
             while (i < vals.Length)
             {
@@ -61,18 +72,31 @@ namespace QuantConnect.Lean.Engine.Results.Analysis.Analyses
                 var tradingDays = j - i;
                 if (tradingDays > 1)
                 {
-                    segments.Add(new
-                    {
-                        start = keys[i],
-                        end = keys[j - 1],
-                        trading_days = tradingDays,
-                    });
+                    segments.Add((keys[i], keys[j - 1], tradingDays));
                 }
                 i = j;
             }
 
-            var potentialSolutions = segments.Count > 0 ? Solutions() : [];
-            return SingleResponse(segments.Count > 0 ? segments : null, potentialSolutions);
+            if (segments.Count == 0)
+            {
+                return SingleResponse(null);
+            }
+
+            // The number of flat segments is unbounded, so only keep the longest ones
+            // and report the total count when there are more than we display.
+            var biggestSegments = segments
+                .OrderByDescending(s => s.tradingDays)
+                .Take(MaxReportedSegments)
+                .Select(s => new
+                {
+                    start = s.start,
+                    end = s.end,
+                    trading_days = s.tradingDays,
+                })
+                .ToList();
+
+            var totalCount = segments.Count > MaxReportedSegments ? segments.Count : (int?)null;
+            return SingleResponse(biggestSegments, totalCount, Solutions());
         }
 
         /// <summary>
@@ -80,14 +104,24 @@ namespace QuantConnect.Lean.Engine.Results.Analysis.Analyses
         /// </summary>
         private static List<string> Solutions() =>
         [
-            "Check if you need to warm-up some data structures, including indicators, RollingWindow objects, and training data.",
+            "Log how often each entry condition passes individually: when several conditions must align " +
+            "(trend, volume, indicator thresholds), it is common that they are never all true at the same time. " +
+            "Relax the single most restrictive condition and re-run, changing one condition per backtest " +
+            "instead of redesigning the strategy.",
+
+            "Check if you need to warm-up some data structures, including indicators, RollingWindow objects, and training data. " +
+            "Log how many assets pass IsReady or warm-up gates: they can silently exclude most of the universe.",
 
             "Check if the algorithm subscribes to any assets. " +
-            "Is the universe selection actually selecting anything?",
+            "Is the universe selection actually selecting anything? Log the selection count on each rebalance.",
 
-            "Check if the trading logic ever leads to a trade.",
+            "Check custom data sources actually deliver data by logging the first points received: " +
+            "a reader or date-format error can silently produce no data and therefore no signals.",
 
-            "Check if there is enough cash to satisify the minimum order sizes.",
+            "Check minimum-history or training-window requirements against the history the data source actually provides: " +
+            "if a model requires more history than exists, the trading logic may never activate.",
+
+            "Check if there is enough cash to satisfy the minimum order sizes.",
         ];
     }
 }

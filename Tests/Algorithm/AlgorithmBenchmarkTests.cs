@@ -18,6 +18,7 @@ using System;
 using System.Collections.Generic;
 using NodaTime;
 using NUnit.Framework;
+using Python.Runtime;
 using QuantConnect.Algorithm;
 using QuantConnect.Configuration;
 using QuantConnect.Interfaces;
@@ -122,6 +123,62 @@ namespace QuantConnect.Tests.Algorithm
                     Assert.AreEqual(0, algorithm.LogMessages.Count);
                     break;
             }
+        }
+
+        [Test]
+        public void PythonSetBenchmarkThrowsDescriptiveErrorForUnsupportedBenchmarkType()
+        {
+            var algorithm = new QCAlgorithm();
+            var dataManager = new DataManagerStub(algorithm, new MockDataFeed());
+            algorithm.SubscriptionManager.SetDataManager(dataManager);
+
+            using (Py.GIL())
+            {
+                // Not a benchmark producing function nor a symbol
+                using var pyBenchmark = Resolution.Daily.ToPython();
+                var exception = Assert.Throws<ArgumentException>(() => algorithm.SetBenchmark(pyBenchmark));
+
+                // The value rendering is case-insensitive to support both pythonnet enum str() conventions ("Daily" and "DAILY")
+                Assert.That(exception.Message, Does.Contain("Daily").IgnoreCase);
+                Assert.That(exception.Message, Does.Contain("'Resolution'"));
+                Assert.That(exception.Message, Does.Contain("The following overloads are available:"));
+                Assert.That(exception.Message, Does.Contain("set_benchmark("));
+                // The PyObject overload that just rejected the value is not hinted
+                Assert.That(exception.Message, Does.Not.Contain("benchmark: Any"));
+                Assert.That(exception.InnerException, Is.TypeOf<InvalidCastException>());
+            }
+        }
+
+        [TestCase(Language.CSharp)]
+        [TestCase(Language.Python)]
+        public void NullBenchmarkDisablesTheBenchmark(Language language)
+        {
+            var algorithm = new QCAlgorithm();
+            var dataManager = new DataManagerStub(algorithm, new MockDataFeed());
+            algorithm.SubscriptionManager.SetDataManager(dataManager);
+
+            if (language == Language.CSharp)
+            {
+                algorithm.SetBenchmark((Symbol)null);
+            }
+            else
+            {
+                using var _ = Py.GIL();
+                using var module = PyModule.FromString(nameof(NullBenchmarkDisablesTheBenchmark), @"
+def set_benchmark(algorithm):
+    algorithm.set_benchmark(None)
+");
+                using var pyAlgorithm = algorithm.ToPython();
+                using var setBenchmark = module.GetAttr("set_benchmark");
+                setBenchmark.Invoke(pyAlgorithm);
+            }
+
+            algorithm.PostInitialize();
+
+            // The default brokerage model benchmark is not used and no benchmark security is added
+            Assert.IsInstanceOf<FuncBenchmark>(algorithm.Benchmark);
+            Assert.AreEqual(0m, algorithm.Benchmark.Evaluate(new DateTime(2024, 1, 2)));
+            Assert.IsEmpty(algorithm.Securities);
         }
 
         [Test]

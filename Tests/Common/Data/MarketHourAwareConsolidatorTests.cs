@@ -17,7 +17,6 @@
 using System;
 using NUnit.Framework;
 using QuantConnect.Data.Market;
-using QuantConnect.Data.Common;
 using QuantConnect.Data.Consolidators;
 using System.Collections.Generic;
 using QuantConnect.Data;
@@ -70,6 +69,35 @@ namespace QuantConnect.Tests.Common.Data
             Assert.AreEqual(1, consolidatedBarsCount);
             Assert.AreEqual(100, latestBar.High);
             Assert.AreEqual(1, latestBar.Low);
+        }
+
+        [Test]
+        public void HandlerSeesPreviousConsolidatedBarWhileReceivingTheNewOne()
+        {
+            var symbol = Symbols.BTCUSD;
+            using var consolidator = new MarketHourAwareConsolidator(true, Resolution.Daily, typeof(TradeBar), TickType.Trade, false);
+
+            IBaseData eventArgument = null;
+            IBaseData consolidatedInsideHandler = null;
+            consolidator.DataConsolidated += (_, bar) =>
+            {
+                eventArgument = bar;
+                consolidatedInsideHandler = ((ConsolidatorBase)consolidator).Consolidated;
+            };
+
+            var time = new DateTime(2015, 04, 13, 10, 0, 0);
+            consolidator.Update(new TradeBar() { Time = time.Subtract(Time.OneMinute), Period = Time.OneMinute, Symbol = symbol, High = 100 });
+
+            time = new DateTime(2015, 04, 14, 0, 0, 0);
+            consolidator.Scan(time);
+
+            // The handler receives the new bar as argument while Consolidated still holds the previous
+            // state, which is null here since this is the first consolidation
+            Assert.IsNotNull(eventArgument);
+            Assert.IsNull(consolidatedInsideHandler);
+
+            // Once the handler returned, the window reflects the just-consolidated bar
+            Assert.AreEqual(eventArgument, ((ConsolidatorBase)consolidator).Consolidated);
         }
 
         [TestCase(true)]
@@ -380,6 +408,25 @@ namespace QuantConnect.Tests.Common.Data
             }
         }
 
+        [Test]
+        public void WindowIsPopulatedOnConsolidation()
+        {
+            var symbol = Symbols.SPY;
+            using var consolidator = new MarketHourAwareConsolidator(false, Resolution.Daily, typeof(TradeBar), TickType.Trade, false);
+
+            consolidator.Update(new TradeBar() { Time = new DateTime(2015, 04, 13, 12, 0, 0), Period = Time.OneMinute, Symbol = symbol, Close = 100 });
+            consolidator.Scan(new DateTime(2015, 04, 14, 0, 0, 0));
+
+            Assert.AreEqual(1, consolidator.Window.Count);
+
+            consolidator.Update(new TradeBar() { Time = new DateTime(2015, 04, 14, 12, 0, 0), Period = Time.OneMinute, Symbol = symbol, Close = 200 });
+            consolidator.Scan(new DateTime(2015, 04, 15, 0, 0, 0));
+
+            Assert.AreEqual(2, consolidator.Window.Count);
+            Assert.AreEqual(200, ((TradeBar)consolidator.Window[0]).Close);
+            Assert.AreEqual(100, ((TradeBar)consolidator.Window[1]).Close);
+        }
+
         protected override IDataConsolidator CreateConsolidator()
         {
             return new MarketHourAwareConsolidator(true, Resolution.Hour, typeof(TradeBar), TickType.Trade, false);
@@ -401,6 +448,8 @@ namespace QuantConnect.Tests.Common.Data
                 new TradeBar(){ Time = time.AddMinutes(8), Period = Time.OneMinute, Symbol = Symbols.SPY, High = 25 },
                 new TradeBar(){ Time = time.AddMinutes(9), Period = Time.OneMinute, Symbol = Symbols.SPY, High = 30 },
                 new TradeBar(){ Time = time.AddMinutes(10), Period = Time.OneMinute, Symbol = Symbols.SPY, High = 26 },
+                new TradeBar(){ Time = time.AddHours(1), Period = Time.OneMinute, Symbol = Symbols.SPY, High = 31 },
+                new TradeBar(){ Time = time.AddHours(2), Period = Time.OneMinute, Symbol = Symbols.SPY, High = 27 },
             };
         }
 

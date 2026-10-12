@@ -15,8 +15,10 @@
 */
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using NUnit.Framework;
+using Python.Runtime;
 using QuantConnect.Data.Market;
 using QuantConnect.Data.UniverseSelection;
 using QuantConnect.Securities;
@@ -60,6 +62,87 @@ namespace QuantConnect.Tests.Common.Securities
             Assert.AreEqual(symbols[5], filtered[2]);
             Assert.AreEqual(symbols[6], filtered[3]);
             Assert.AreEqual(symbols[7], filtered[4]);
+        }
+
+        [Test]
+        public void CountReturnsTheNumberOfContractsInTheUniverse()
+        {
+            var time = new DateTime(2016, 02, 26);
+            var symbols = new[]
+            {
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(3)),
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(5)),
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(10)),
+            };
+            var data = symbols.Select(x => new FutureUniverse() { Symbol = x }).ToList();
+            var universe = new FutureFilterUniverse(data, time);
+
+            Assert.AreEqual(symbols.Length, universe.Count);
+
+            // Filter and check the count reflects the filtered contracts
+            universe.Expiration(TimeSpan.FromDays(3), TimeSpan.FromDays(7));
+            Assert.AreEqual(2, universe.Count);
+        }
+
+        [Test]
+        public void CountIsUpdatedAsFiltersReduceTheUniverse()
+        {
+            var time = new DateTime(2016, 02, 26);
+            var symbols = Enumerable.Range(0, 10)
+                .Select(i => Symbol.CreateFuture("SPY", Market.CME, time.AddDays(i)))
+                .ToArray();
+            var data = symbols.Select(x => new FutureUniverse() { Symbol = x }).ToList();
+            var universe = new FutureFilterUniverse(data, time);
+
+            Assert.AreEqual(symbols.Length, universe.Count);
+
+            // Contracts expiring within 3 to 7 days
+            universe.Expiration(TimeSpan.FromDays(3), TimeSpan.FromDays(7));
+            Assert.AreEqual(5, universe.Count);
+
+            // Out of those, only the earliest expiring contract
+            universe.FrontMonth();
+            Assert.AreEqual(1, universe.Count);
+        }
+
+        [Test]
+        public void PythonLenReturnsTheNumberOfContractsInTheUniverse()
+        {
+            var time = new DateTime(2016, 02, 26);
+            var symbols = new[]
+            {
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(0)), // 0
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(1)), // 1
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(2)), // 2
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(3)), // 3
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(4)), // 4
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(5)), // 5
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(6)), // 6
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(7)), // 7
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(8)), // 8
+                Symbol.CreateFuture("SPY", Market.CME, time.AddDays(9)), // 9
+            };
+            var data = symbols.Select(x => new FutureUniverse() { Symbol = x }).ToList();
+            var universe = new FutureFilterUniverse(data, time);
+
+            using (Py.GIL())
+            {
+                using var module = PyModule.FromString("testModule",
+                    @"
+def get_length(universe):
+    return len(universe)");
+                using var getLength = module.GetAttr("get_length");
+                using var pyUniverse = universe.ToPython();
+
+                // The whole universe
+                using var length = getLength.Invoke(pyUniverse);
+                Assert.AreEqual(symbols.Length, length.As<int>());
+
+                // Filter and check the length reflects the filtered contracts
+                universe.Expiration(TimeSpan.FromDays(3), TimeSpan.FromDays(7));
+                using var filteredLength = getLength.Invoke(pyUniverse);
+                Assert.AreEqual(5, filteredLength.As<int>());
+            }
         }
 
         [TestCase(false, 6)]
@@ -292,6 +375,71 @@ namespace QuantConnect.Tests.Common.Securities
 
             var filtered = filter.Filter(new FutureFilterUniverse(data.ToList(), new DateTime(2016, 02, 26))).ToList();
             Assert.AreEqual(5, filtered.Count);
+        }
+
+        [Test]
+        public void FiltersContractMonths()
+        {
+            var time = new DateTime(2013, 10, 7);
+            // ES contracts are named after their expiration month, crude oil contracts after the month following it
+            var data = new List<FutureUniverse>
+            {
+                new() { Symbol = Symbol.CreateFuture("ES", Market.CME, new DateTime(2013, 12, 20)) },
+                new() { Symbol = Symbol.CreateFuture("ES", Market.CME, new DateTime(2014, 3, 21)) },
+                new() { Symbol = Symbol.CreateFuture("CL", Market.NYMEX, new DateTime(2013, 11, 20)) },
+                new() { Symbol = Symbol.CreateFuture("CL", Market.NYMEX, new DateTime(2014, 2, 20)) },
+                new() { Symbol = Symbol.CreateFuture("CL", Market.NYMEX, new DateTime(2014, 5, 20)) }
+            };
+            FutureFilterUniverse Universe() => new(data, time);
+            static IEnumerable<Symbol> Symbols(FutureFilterUniverse universe) => universe.AsEnumerable().Select(x => x.Symbol);
+
+            CollectionAssert.AreEqual(new[] { data[0].Symbol, data[2].Symbol }, Symbols(Universe().ContractMonths([12])));
+            CollectionAssert.AreEqual(new[] { data[1].Symbol, data[3].Symbol, data[4].Symbol }, Symbols(Universe().ContractMonths([3, 6])));
+            CollectionAssert.AreEqual(new[] { data[0].Symbol, data[1].Symbol }, Symbols(Universe().ExpirationCycle(FutureExpirationCycles.March)));
+            CollectionAssert.AreEqual(data.Select(x => x.Symbol), Symbols(Universe().ContractMonths(FutureExpirationCycles.March)));
+            Assert.AreEqual(0, Universe().ContractMonths([2]).Count);
+            Assert.AreEqual(0, Universe().ContractMonths([]).Count);
+        }
+
+        [Test]
+        public void FiltersExpirationSetsBoundsAndFarthestExpiration()
+        {
+            var time = new DateTime(2013, 10, 7);
+            var expiries = new[]
+            {
+                new DateTime(2013, 12, 20), new DateTime(2014, 3, 21), new DateTime(2014, 6, 20), new DateTime(2014, 9, 19), new DateTime(2014, 12, 19)
+            };
+            var data = expiries.Select(expiry => new FutureUniverse { Symbol = Symbol.CreateFuture("ES", Market.CME, expiry) }).ToList();
+            FutureFilterUniverse Universe() => new(data, time);
+            static IEnumerable<DateTime> Expiries(FutureFilterUniverse universe) => universe.Select(x => x.Symbol.ID.Date);
+
+            // sets ignore the time of day, bounds exclude the date itself
+            CollectionAssert.AreEqual(new[] { expiries[1], expiries[3] }, Expiries(Universe().Expiration([expiries[1], expiries[3].AddHours(10)])));
+            Assert.AreEqual(0, Universe().Expiration([]).Count);
+            CollectionAssert.AreEqual(expiries.Skip(1), Expiries(Universe().ExpiringAfter(expiries[0])));
+            CollectionAssert.AreEqual(expiries.Take(2), Expiries(Universe().ExpiringBefore(expiries[2])));
+            CollectionAssert.AreEqual(new[] { expiries[2] }, Expiries(Universe().ExpiringAfter(expiries[1]).ExpiringBefore(expiries[3])));
+            CollectionAssert.AreEqual(new[] { expiries[4] }, Expiries(Universe().FarthestExpiration()));
+            CollectionAssert.AreEqual(new[] { expiries[0] }, Expiries(Universe().FrontMonth()));
+            Assert.AreEqual(0, new FutureFilterUniverse(new List<FutureUniverse>(), time).FarthestExpiration().Count);
+        }
+
+        [Test]
+        public void FiltersOpenInterestVolumeAndZeroDte()
+        {
+            var time = new DateTime(2013, 10, 7);
+            var expiries = new[] { time, new DateTime(2013, 12, 20), new DateTime(2014, 3, 21), new DateTime(2014, 6, 20) };
+            // the universe rows carry open, high, low, close, volume and open interest
+            var data = expiries.Select((expiry, i) => new FutureUniverse(time, Symbol.CreateFuture("ES", Market.CME, expiry), $"1,1,1,1,{1000 * (i + 1)},{10 * (i + 1)}")).ToList();
+            FutureFilterUniverse Universe() => new(data, time);
+            static IEnumerable<DateTime> Expiries(FutureFilterUniverse universe) => universe.Select(x => x.Symbol.ID.Date);
+
+            CollectionAssert.AreEqual(new[] { expiries[0] }, Expiries(Universe().ZeroDte()));
+            CollectionAssert.AreEqual(new[] { expiries[1], expiries[2] }, Expiries(Universe().OpenInterest(20, 30)));
+            CollectionAssert.AreEqual(new[] { expiries[3] }, Expiries(Universe().OI(31, long.MaxValue)));
+            CollectionAssert.AreEqual(new[] { expiries[0], expiries[1] }, Expiries(Universe().Volume(0, 2000)));
+            CollectionAssert.AreEqual(new[] { expiries[2] }, Expiries(Universe().Volume(2500, 3500).OpenInterest(0, 100)));
+            Assert.AreEqual(0, Universe().Volume(5000, 6000).Count);
         }
 
         [Test]

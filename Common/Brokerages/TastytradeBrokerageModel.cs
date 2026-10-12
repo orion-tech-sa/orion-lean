@@ -55,7 +55,7 @@ namespace QuantConnect.Brokerages
         /// <summary>
         /// The set of <see cref="OrderType"/> values that cannot be used for cross-zero execution.
         /// </summary>
-        private static IReadOnlySet<OrderType> NotSupportedCrossZeroOrderTypes => new HashSet<OrderType>()
+        private static readonly IReadOnlySet<OrderType> NotSupportedCrossZeroOrderTypes = new HashSet<OrderType>()
         {
             OrderType.ComboLimit
         };
@@ -88,6 +88,11 @@ namespace QuantConnect.Brokerages
         /// <returns>True if the brokerage could process the order, false otherwise</returns>
         public override bool CanSubmitOrder(Security security, Order order, out BrokerageMessageEvent message)
         {
+            if (!this.ValidateContingentOrdersNotSupported(order, out message))
+            {
+                return false;
+            }
+
             message = default;
 
             if (!_supportSecurityTypes.Contains(security.Type))

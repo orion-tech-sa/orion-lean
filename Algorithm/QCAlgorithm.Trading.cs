@@ -31,9 +31,11 @@ namespace QuantConnect.Algorithm
     {
         private int _maxOrders = 10000;
         private bool _isMarketOnOpenOrderWarningSent;
+        private bool _isDailyResolutionMarketOrderConversionWarningSent;
         private bool _isMarketOnOpenOrderRestrictedForFuturesWarningSent;
         private bool _isGtdTfiForMooAndMocOrdersValidationWarningSent;
         private bool _isOptionsOrderOnStockSplitWarningSent;
+        private bool _liquidateSymbolNotFoundWarningSent;
 
         /// <summary>
         /// Transaction Manager - Process transaction fills and order management.
@@ -238,37 +240,7 @@ namespace QuantConnect.Algorithm
         [DocumentationAttribute(TradingAndOrders)]
         public OrderTicket MarketOrder(Symbol symbol, decimal quantity, bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var security = GetSecurityForOrder(symbol);
-
-            // check the exchange is open before sending a market order, if it's not open then convert it into a market on open order.
-            // For futures and FOPs, market orders can be submitted on extended hours, so we let them through.
-            if ((security.Type != SecurityType.Future && security.Type != SecurityType.FutureOption) && !security.Exchange.ExchangeOpen)
-            {
-                var mooTicket = MarketOnOpenOrder(security.Symbol, quantity, asynchronous, tag, orderProperties);
-                if (!_isMarketOnOpenOrderWarningSent)
-                {
-                    var anyNonDailySubscriptions = security.Subscriptions.Any(x => x.Resolution != Resolution.Daily);
-                    if (mooTicket.SubmitRequest.Response.IsSuccess && !anyNonDailySubscriptions)
-                    {
-                        Debug("Warning: all market orders sent using daily data, or market orders sent after hours are automatically converted into MarketOnOpen orders.");
-                        _isMarketOnOpenOrderWarningSent = true;
-                    }
-                }
-                return mooTicket;
-            }
-
-            var request = CreateSubmitOrderRequest(OrderType.Market, security, quantity, tag, orderProperties ?? DefaultOrderProperties?.Clone(), asynchronous);
-
-            //Add the order and create a new order Id.
-            var ticket = SubmitOrderRequest(request);
-
-            // Wait for the order event to process, only if the exchange is open and the order is valid
-            if (ticket.Status != OrderStatus.Invalid && !asynchronous)
-            {
-                Transactions.WaitForOrder(ticket.OrderId);
-            }
-
-            return ticket;
+            return SubmitOrder(OrderFactory.MarketOrder(symbol, quantity, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -313,13 +285,7 @@ namespace QuantConnect.Algorithm
         [DocumentationAttribute(TradingAndOrders)]
         public OrderTicket MarketOnOpenOrder(Symbol symbol, decimal quantity, bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var properties = orderProperties ?? DefaultOrderProperties?.Clone();
-            InvalidateGoodTilDateTimeInForce(properties);
-
-            var security = GetSecurityForOrder(symbol);
-            var request = CreateSubmitOrderRequest(OrderType.MarketOnOpen, security, quantity, tag, properties, asynchronous);
-
-            return SubmitOrderRequest(request);
+            return SubmitOrder(OrderFactory.MarketOnOpenOrder(symbol, quantity, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -364,13 +330,38 @@ namespace QuantConnect.Algorithm
         [DocumentationAttribute(TradingAndOrders)]
         public OrderTicket MarketOnCloseOrder(Symbol symbol, decimal quantity, bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var properties = orderProperties ?? DefaultOrderProperties?.Clone();
-            InvalidateGoodTilDateTimeInForce(properties);
+            return SubmitOrder(OrderFactory.MarketOnCloseOrder(symbol, quantity, asynchronous, tag, orderProperties));
+        }
 
-            var security = GetSecurityForOrder(symbol);
-            var request = CreateSubmitOrderRequest(OrderType.MarketOnClose, security, quantity, tag, properties, asynchronous);
+        /// <summary>
+        /// Determines whether the given symbol is subscribed only at daily resolution, i.e. there is no intraday
+        /// (sub-daily) data to fill a market order against. Internal subscriptions are excluded. The current,
+        /// non-stale subscriptions are fetched from the subscription manager rather than from the security.
+        /// </summary>
+        private bool IsDailyResolutionOnly(Symbol symbol)
+        {
+            var configs = SubscriptionManager.SubscriptionDataConfigService.GetSubscriptionDataConfigs(symbol);
+            return configs.Count > 0 && configs.All(x => x.Resolution == Resolution.Daily);
+        }
 
-            return SubmitOrderRequest(request);
+        /// <summary>
+        /// Determines whether a <see cref="OrderType.MarketOnClose"/> order for the given security would be rejected
+        /// for being submitted too close to the market close (within <see cref="Orders.MarketOnCloseOrder.SubmissionTimeBuffer"/>).
+        /// Mirrors the validation enforced in <see cref="PreOrderChecksImpl"/>.
+        /// </summary>
+        private bool IsWithinMarketOnCloseSubmissionBuffer(Security security)
+        {
+            if (security.Exchange.Hours.IsMarketAlwaysOpen)
+            {
+                return false;
+            }
+
+            var nextMarketClose = security.Exchange.Hours.GetNextMarketClose(security.LocalTime, false);
+            var latestSubmissionTimeUtc = nextMarketClose
+                .ConvertToUtc(security.Exchange.TimeZone)
+                .Subtract(Orders.MarketOnCloseOrder.SubmissionTimeBuffer);
+
+            return UtcTime > latestSubmissionTimeUtc;
         }
 
         /// <summary>
@@ -418,11 +409,7 @@ namespace QuantConnect.Algorithm
         [DocumentationAttribute(TradingAndOrders)]
         public OrderTicket LimitOrder(Symbol symbol, decimal quantity, decimal limitPrice, bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var security = GetSecurityForOrder(symbol);
-            var request = CreateSubmitOrderRequest(OrderType.Limit, security, quantity, tag,
-                orderProperties ?? DefaultOrderProperties?.Clone(), asynchronous, limitPrice: limitPrice);
-
-            return SubmitOrderRequest(request);
+            return SubmitOrder(OrderFactory.LimitOrder(symbol, quantity, limitPrice, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -470,11 +457,7 @@ namespace QuantConnect.Algorithm
         [DocumentationAttribute(TradingAndOrders)]
         public OrderTicket StopMarketOrder(Symbol symbol, decimal quantity, decimal stopPrice, bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var security = GetSecurityForOrder(symbol);
-            var request = CreateSubmitOrderRequest(OrderType.StopMarket, security, quantity, tag,
-                orderProperties ?? DefaultOrderProperties?.Clone(), asynchronous, stopPrice: stopPrice);
-
-            return SubmitOrderRequest(request);
+            return SubmitOrder(OrderFactory.StopMarketOrder(symbol, quantity, stopPrice, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -531,10 +514,7 @@ namespace QuantConnect.Algorithm
         public OrderTicket TrailingStopOrder(Symbol symbol, decimal quantity, decimal trailingAmount, bool trailingAsPercentage,
             bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var security = GetSecurityForOrder(symbol);
-            var stopPrice = Orders.TrailingStopOrder.CalculateStopPrice(security.Price, trailingAmount, trailingAsPercentage,
-                quantity > 0 ? OrderDirection.Buy : OrderDirection.Sell);
-            return TrailingStopOrder(symbol, quantity, stopPrice, trailingAmount, trailingAsPercentage, asynchronous, tag, orderProperties);
+            return SubmitOrder(OrderFactory.TrailingStopOrder(symbol, quantity, trailingAmount, trailingAsPercentage, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -591,19 +571,7 @@ namespace QuantConnect.Algorithm
         public OrderTicket TrailingStopOrder(Symbol symbol, decimal quantity, decimal stopPrice, decimal trailingAmount, bool trailingAsPercentage,
             bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var security = GetSecurityForOrder(symbol);
-            var request = CreateSubmitOrderRequest(
-                OrderType.TrailingStop,
-                security,
-                quantity,
-                tag,
-                stopPrice: stopPrice,
-                trailingAmount: trailingAmount,
-                trailingAsPercentage: trailingAsPercentage,
-                properties: orderProperties ?? DefaultOrderProperties?.Clone(),
-                asynchronous: asynchronous);
-
-            return SubmitOrderRequest(request);
+            return SubmitOrder(OrderFactory.TrailingStopOrder(symbol, quantity, stopPrice, trailingAmount, trailingAsPercentage, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -657,11 +625,7 @@ namespace QuantConnect.Algorithm
         public OrderTicket StopLimitOrder(Symbol symbol, decimal quantity, decimal stopPrice, decimal limitPrice,
             bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var security = GetSecurityForOrder(symbol);
-            var request = CreateSubmitOrderRequest(OrderType.StopLimit, security, quantity, tag, stopPrice: stopPrice,
-                limitPrice: limitPrice, properties: orderProperties ?? DefaultOrderProperties?.Clone(), asynchronous: asynchronous);
-
-            return SubmitOrderRequest(request);
+            return SubmitOrder(OrderFactory.StopLimitOrder(symbol, quantity, stopPrice, limitPrice, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -715,12 +679,7 @@ namespace QuantConnect.Algorithm
         public OrderTicket LimitIfTouchedOrder(Symbol symbol, decimal quantity, decimal triggerPrice, decimal limitPrice,
             bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var security = GetSecurityForOrder(symbol);
-            var request = CreateSubmitOrderRequest(OrderType.LimitIfTouched, security, quantity, tag,
-                triggerPrice: triggerPrice, limitPrice: limitPrice, properties: orderProperties ?? DefaultOrderProperties?.Clone(),
-                asynchronous: asynchronous);
-
-            return SubmitOrderRequest(request);
+            return SubmitOrder(OrderFactory.LimitIfTouchedOrder(symbol, quantity, triggerPrice, limitPrice, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -735,30 +694,7 @@ namespace QuantConnect.Algorithm
         [DocumentationAttribute(TradingAndOrders)]
         public OrderTicket ExerciseOption(Symbol optionSymbol, int quantity, bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            var option = (Option)GetSecurityForOrder(optionSymbol);
-
-            // SubmitOrderRequest.Quantity indicates the change in holdings quantity, therefore manual exercise quantities must be negative
-            // PreOrderChecksImpl confirms that we don't hold a short position, so we're lenient here and accept +/- quantity values
-            var request = CreateSubmitOrderRequest(OrderType.OptionExercise, option, -Math.Abs(quantity), tag,
-                orderProperties ?? DefaultOrderProperties?.Clone(), asynchronous);
-
-            //Initialize the exercise order parameters
-            var preOrderCheckResponse = PreOrderChecks(request);
-            if (preOrderCheckResponse.IsError)
-            {
-                return OrderTicket.InvalidSubmitRequest(Transactions, request, preOrderCheckResponse);
-            }
-
-            //Add the order and create a new order Id.
-            var ticket = Transactions.AddOrder(request);
-
-            // Wait for the order event to process, only if the exchange is open
-            if (!asynchronous)
-            {
-                Transactions.WaitForOrder(ticket.OrderId);
-            }
-
-            return ticket;
+            return SubmitOrder(OrderFactory.ExerciseOption(optionSymbol, quantity, asynchronous, tag, orderProperties));
         }
 
         // Support for option strategies trading
@@ -820,7 +756,7 @@ namespace QuantConnect.Algorithm
         [DocumentationAttribute(TradingAndOrders)]
         public List<OrderTicket> ComboMarketOrder(List<Leg> legs, int quantity, bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            return SubmitComboOrder(legs, quantity, 0, asynchronous, tag, orderProperties);
+            return SubmitOrders(OrderFactory.ComboMarketOrder(legs, quantity, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -837,12 +773,7 @@ namespace QuantConnect.Algorithm
         public List<OrderTicket> ComboLegLimitOrder(List<Leg> legs, int quantity, bool asynchronous = false,
             string tag = "", IOrderProperties orderProperties = null)
         {
-            if (legs.Any(x => x.OrderPrice == null || x.OrderPrice == 0))
-            {
-                throw new ArgumentException("ComboLegLimitOrder requires a limit price for each leg");
-            }
-
-            return SubmitComboOrder(legs, quantity, 0, asynchronous, tag, orderProperties);
+            return SubmitOrders(OrderFactory.ComboLegLimitOrder(legs, quantity, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -861,97 +792,12 @@ namespace QuantConnect.Algorithm
         public List<OrderTicket> ComboLimitOrder(List<Leg> legs, int quantity, decimal limitPrice,
             bool asynchronous = false, string tag = "", IOrderProperties orderProperties = null)
         {
-            if (limitPrice == 0)
-            {
-                throw new ArgumentException("ComboLimitOrder requires a limit price");
-            }
-
-            if (legs.Any(x => x.OrderPrice != null && x.OrderPrice != 0))
-            {
-                throw new ArgumentException("ComboLimitOrder does not support limit prices for individual legs");
-            }
-
-            return SubmitComboOrder(legs, quantity, limitPrice, asynchronous, tag, orderProperties);
+            return SubmitOrders(OrderFactory.ComboLimitOrder(legs, quantity, limitPrice, asynchronous, tag, orderProperties));
         }
 
         private List<OrderTicket> GenerateOptionStrategyOrders(OptionStrategy strategy, int strategyQuantity, bool asynchronous, string tag, IOrderProperties orderProperties)
         {
-            // Make sure the strategy is initialized, that is, canonical and leg symbols are set.
-            strategy.SetSymbols();
-
-            // setting up the tag text for all orders of one strategy
-            tag ??= $"{strategy.Name} ({strategyQuantity.ToStringInvariant()})";
-
-            var legs = strategy.UnderlyingLegs.Cast<Leg>().Concat(strategy.OptionLegs).ToList();
-
-            return SubmitComboOrder(legs, strategyQuantity, 0, asynchronous, tag, orderProperties);
-        }
-
-        private List<OrderTicket> SubmitComboOrder(List<Leg> legs, decimal quantity, decimal limitPrice, bool asynchronous, string tag, IOrderProperties orderProperties)
-        {
-            CheckComboOrderSizing(legs, quantity);
-
-            var orderType = OrderType.ComboMarket;
-            if (limitPrice != 0)
-            {
-                orderType = OrderType.ComboLimit;
-            }
-
-            // we create a unique Id so the algorithm and the brokerage can relate the combo orders with each other
-            var groupOrderManager = new GroupOrderManager(Transactions.GetIncrementGroupOrderManagerId(), legs.Count, quantity, limitPrice);
-
-            List<OrderTicket> orderTickets = new(capacity: legs.Count);
-            List<SubmitOrderRequest> submitRequests = new(capacity: legs.Count);
-            foreach (var leg in legs)
-            {
-                var security = GetSecurityForOrder(leg.Symbol);
-
-                if (leg.OrderPrice.HasValue)
-                {
-                    // limit price per leg!
-                    limitPrice = leg.OrderPrice.Value;
-                    orderType = OrderType.ComboLegLimit;
-                }
-                var request = CreateSubmitOrderRequest(
-                    orderType,
-                    security,
-                    ((decimal)leg.Quantity).GetOrderLegGroupQuantity(groupOrderManager),
-                    tag,
-                    orderProperties ?? DefaultOrderProperties?.Clone(),
-                    groupOrderManager: groupOrderManager,
-                    limitPrice: limitPrice,
-                    asynchronous: asynchronous);
-
-                // we execture pre order checks for all requests before submitting, so that if anything fails we are not left with half submitted combo orders
-                var response = PreOrderChecks(request);
-                if (response.IsError)
-                {
-                    orderTickets.Add(OrderTicket.InvalidSubmitRequest(Transactions, request, response));
-                    return orderTickets;
-                }
-
-                submitRequests.Add(request);
-            }
-
-            foreach (var request in submitRequests)
-            {
-                //Add the order and create a new order Id.
-                orderTickets.Add(Transactions.AddOrder(request));
-            }
-
-            // Wait for the order event to process, only if the exchange is open
-            if (!asynchronous && orderType == OrderType.ComboMarket)
-            {
-                foreach (var ticket in orderTickets)
-                {
-                    if (ticket.Status.IsOpen())
-                    {
-                        Transactions.WaitForOrder(ticket.OrderId);
-                    }
-                }
-            }
-
-            return orderTickets;
+            return SubmitOrders(OrderFactory.OptionStrategyOrder(strategy, strategyQuantity, asynchronous, tag, orderProperties));
         }
 
         /// <summary>
@@ -1149,7 +995,13 @@ namespace QuantConnect.Algorithm
 
                 if (security.Exchange.Hours.IsOpen(security.LocalTime, false))
                 {
-                    return OrderResponse.Error(request, OrderResponseErrorCode.MarketOnOpenNotAllowedDuringRegularHours, $"Cannot submit a {nameof(OrderType.MarketOnOpen)} order while the market is open.");
+                    // A security subscribed only to daily resolution has no intraday data to fill against, so
+                    // MarketOnOpen/MarketOnClose are its execution proxies; allow MOO during regular hours for those
+                    // (e.g. when a daily market order is converted near the close, past the MarketOnClose buffer).
+                    if (!IsDailyResolutionOnly(security.Symbol))
+                    {
+                        return OrderResponse.Error(request, OrderResponseErrorCode.MarketOnOpenNotAllowedDuringRegularHours, $"Cannot submit a {nameof(OrderType.MarketOnOpen)} order while the market is open.");
+                    }
                 }
             }
             else if (request.OrderType == OrderType.MarketOnClose)
@@ -1159,17 +1011,12 @@ namespace QuantConnect.Algorithm
                     throw new InvalidOperationException($"Market never closes for this symbol {security.Symbol}, can no submit a {nameof(OrderType.MarketOnClose)} order.");
                 }
 
-                var nextMarketClose = security.Exchange.Hours.GetNextMarketClose(security.LocalTime, false);
-
-                // Enforce MarketOnClose submission buffer
-                var latestSubmissionTimeUtc = nextMarketClose
-                    .ConvertToUtc(security.Exchange.TimeZone)
-                    .Subtract(Orders.MarketOnCloseOrder.SubmissionTimeBuffer);
-                if (UtcTime > latestSubmissionTimeUtc)
+                // Enforce MarketOnClose submission buffer.
+                // Default buffer is 15.5 minutes because with minute data a user will receive the 3:44->3:45 bar at 3:45,
+                // if the latest time is 3:45 it is already too late to submit one of these orders
+                if (IsWithinMarketOnCloseSubmissionBuffer(security))
                 {
                     // Tell user the required buffer on these orders, also inform them it can be changed for special cases.
-                    // Default buffer is 15.5 minutes because with minute data a user will receive the 3:44->3:45 bar at 3:45,
-                    // if the latest time is 3:45 it is already too late to submit one of these orders
                     return OrderResponse.Error(request, OrderResponseErrorCode.MarketOnCloseOrderTooLate,
                         $"MarketOnClose orders must be placed within {Orders.MarketOnCloseOrder.SubmissionTimeBuffer} before market close." +
                         " Override this TimeSpan buffer by setting Orders.MarketOnCloseOrder.SubmissionTimeBuffer in QCAlgorithm.Initialize()."
@@ -1214,7 +1061,7 @@ namespace QuantConnect.Algorithm
         private Security GetSecurityForOrder(Symbol symbol)
         {
             var isCanonical = symbol.IsCanonical();
-            if (Securities.TryGetValue(symbol, out var security) && 
+            if (Securities.TryGetValue(symbol, out var security) &&
                 // Let canonical and delisted securities through instead of throwing. An invalid ticket will be returned later on when trying to submit the order.
                 (isCanonical || security.IsTradable || security.IsDelisted))
             {
@@ -1224,12 +1071,9 @@ namespace QuantConnect.Algorithm
             if (security == null || !security.IsTradable)
             {
                 // Try to add and seed the security, but don't is it's a canonical symbol
-                if (!isCanonical &&
+                if (CanAutoAddSecurity(symbol) &&
                     // Indexes are not tradable by default
-                    symbol.SecurityType != SecurityType.Index &&
-                    (!symbol.HasUnderlying ||
-                     (symbol.SecurityType.IsOption() && !OptionSymbol.IsOptionContractExpired(symbol, UtcTime)) ||
-                     (symbol.SecurityType == SecurityType.Future && !FuturesExpiryUtilityFunctions.IsFutureContractExpired(symbol, UtcTime, MarketHoursDatabase))))
+                    symbol.SecurityType != SecurityType.Index)
                 {
                     // Send one time warning
                     security = AddSecurity(symbol);
@@ -1248,6 +1092,21 @@ namespace QuantConnect.Algorithm
         }
 
         /// <summary>
+        /// Determines whether the given symbol can be automatically added to the algorithm on the user's behalf,
+        /// so that it does not need to be explicitly subscribed to before being used. This is the case both when
+        /// submitting an order (see <see cref="GetSecurityForOrder"/>) and when registering an indicator or
+        /// consolidator for a symbol the user has not subscribed to. Canonical symbols (universes) and expired
+        /// option/future contracts are excluded.
+        /// </summary>
+        private bool CanAutoAddSecurity(Symbol symbol)
+        {
+            return !symbol.IsCanonical() &&
+                (!symbol.HasUnderlying ||
+                 (symbol.SecurityType.IsOption() && !OptionSymbol.IsOptionContractExpired(symbol, UtcTime)) ||
+                 (symbol.SecurityType == SecurityType.Future && !FuturesExpiryUtilityFunctions.IsFutureContractExpired(symbol, UtcTime, MarketHoursDatabase)));
+        }
+
+        /// <summary>
         /// Liquidate your portfolio holdings
         /// </summary>
         /// <param name="symbol">Specific asset to liquidate, defaults to all</param>
@@ -1260,8 +1119,7 @@ namespace QuantConnect.Algorithm
             IEnumerable<Symbol> toLiquidate;
             if (symbol != null)
             {
-                toLiquidate = Securities.ContainsKey(symbol)
-                    ? new[] { symbol } : Enumerable.Empty<Symbol>();
+                toLiquidate = new[] { symbol };
             }
             else
             {
@@ -1291,6 +1149,17 @@ namespace QuantConnect.Algorithm
             tag ??= "Liquidated";
             foreach (var symbolToLiquidate in symbols)
             {
+                // skip symbols that have not been added to the algorithm instead of throwing
+                if (!Securities.ContainsKey(symbolToLiquidate))
+                {
+                    if (!_liquidateSymbolNotFoundWarningSent)
+                    {
+                        _liquidateSymbolNotFoundWarningSent = true;
+                        Debug($"Warning: liquidate ignored symbol '{symbolToLiquidate}' because it has not been added to the algorithm. Add the security before liquidating it.");
+                    }
+                    continue;
+                }
+
                 // get open orders
                 var orders = Transactions.GetOpenOrders(symbolToLiquidate);
 
@@ -1626,29 +1495,6 @@ namespace QuantConnect.Algorithm
                 return security.IsMarketOpen(false);
             }
             return symbol.IsMarketOpen(UtcTime, false);
-        }
-
-        private SubmitOrderRequest CreateSubmitOrderRequest(OrderType orderType, Security security, decimal quantity, string tag,
-            IOrderProperties properties, bool asynchronous, decimal stopPrice = 0m, decimal limitPrice = 0m, decimal triggerPrice = 0m, decimal trailingAmount = 0m,
-            bool trailingAsPercentage = false, GroupOrderManager groupOrderManager = null)
-        {
-            return new SubmitOrderRequest(orderType, security.Type, security.Symbol, quantity, stopPrice, limitPrice, triggerPrice, trailingAmount,
-                trailingAsPercentage, UtcTime, tag, properties, groupOrderManager, asynchronous);
-        }
-
-        private static void CheckComboOrderSizing(List<Leg> legs, decimal quantity)
-        {
-            var greatestsCommonDivisor = Math.Abs(legs.Select(leg => leg.Quantity).GreatestCommonDivisor());
-
-            if (greatestsCommonDivisor != 1)
-            {
-                throw new ArgumentException(
-                    "The global combo quantity should be used to increase or reduce the size of the order, " +
-                    "while the leg quantities should be used to specify the ratio of the order. " +
-                    "The combo order quantities should be reduced " +
-                    $"from {quantity}x({string.Join(", ", legs.Select(leg => $"{leg.Quantity} {leg.Symbol}"))}) " +
-                    $"to {quantity * greatestsCommonDivisor}x({string.Join(", ", legs.Select(leg => $"{leg.Quantity / greatestsCommonDivisor} {leg.Symbol}"))}).");
-            }
         }
 
         /// <summary>

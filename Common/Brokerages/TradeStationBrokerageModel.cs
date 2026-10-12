@@ -15,6 +15,7 @@
 */
 
 using System;
+using System.Linq;
 using QuantConnect.Orders;
 using QuantConnect.Securities;
 using QuantConnect.Orders.Fees;
@@ -56,6 +57,16 @@ namespace QuantConnect.Brokerages
         };
 
         /// <summary>
+        /// The contingency types supported by the brokerage: OCO and BRK (a fill reduces the rest) order groups and order sends order (OSO)
+        /// </summary>
+        private readonly HashSet<ContingencyType> _supportedContingencyTypes = new()
+        {
+            ContingencyType.OneCancelsOther,
+            ContingencyType.OneTriggersOther,
+            ContingencyType.OneUpdatesOther
+        };
+
+        /// <summary>
         /// HashSet containing the order types supported by the <see cref="CanSubmitOrder"/> operation in TradeStation.
         /// </summary>
         private readonly HashSet<OrderType> _supportOrderTypes = new(
@@ -75,7 +86,7 @@ namespace QuantConnect.Brokerages
         /// <summary>
         /// The set of <see cref="OrderType"/> values that cannot be used for cross-zero execution.
         /// </summary>
-        private static IReadOnlySet<OrderType> NotSupportedCrossZeroOrderTypes => new HashSet<OrderType>()
+        private static readonly IReadOnlySet<OrderType> NotSupportedCrossZeroOrderTypes = new HashSet<OrderType>()
         {
             OrderType.ComboMarket,
             OrderType.ComboLimit,
@@ -140,6 +151,27 @@ namespace QuantConnect.Brokerages
                 return false;
             }
 
+            // order groups (OCO, BRK) and order sends order (OSO)
+            if (!this.ValidateContingentOrder(order, _supportedContingencyTypes, out message, supportsComboOrders: false, supportsNesting: false))
+            {
+                return false;
+            }
+
+            if (order.GetSiblingLink()?.Type == ContingencyType.OneUpdatesOther)
+            {
+                // a bracket (BRK) group, where a fill reduces the other orders, requires the same symbol and a stop order
+                if (order.Contingency.Symbols.Count > 1)
+                {
+                    message = this.UnsupportedContingentOrdersShape($"{ContingencyType.OneUpdatesOther} orders have to be for the same symbol.");
+                    return false;
+                }
+                if (!order.Contingency.GetSiblingOrderTypes().Any(type => type is OrderType.StopMarket or OrderType.StopLimit or OrderType.TrailingStop))
+                {
+                    message = this.UnsupportedContingentOrdersShape($"{ContingencyType.OneUpdatesOther} orders require a stop order.");
+                    return false;
+                }
+            }
+
             if (!BrokerageExtensions.ValidateCrossZeroOrder(this, security, order, out message, NotSupportedCrossZeroOrderTypes))
             {
                 return false;
@@ -173,23 +205,7 @@ namespace QuantConnect.Brokerages
                 return false;
             }
 
-            if (IsComboOrderType(order.Type) && request.Quantity != null && request.Quantity != order.Quantity)
-            {
-                message = new BrokerageMessageEvent(BrokerageMessageType.Warning, "NotSupported", Messages.DefaultBrokerageModel.UnsupportedUpdateQuantityOrder(this, order.Type));
-                return false;
-            }
-
             return true;
-        }
-
-        /// <summary>
-        /// Determines if the provided order type is a combo order.
-        /// </summary>
-        /// <param name="orderType">The order type to check.</param>
-        /// <returns>True if the order type is a combo order; otherwise, false.</returns>
-        private static bool IsComboOrderType(OrderType orderType)
-        {
-            return orderType == OrderType.ComboMarket || orderType == OrderType.ComboLimit;
         }
 
         /// <summary>

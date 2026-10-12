@@ -49,6 +49,12 @@ namespace QuantConnect.Data.Market
         public DateTime Expiry => Symbol.ID.Date;
 
         /// <summary>
+        /// Calendar days from this contract's time until it stops trading
+        /// </summary>
+        [PandasIgnore]
+        public virtual int DaysToExpiry => (Expiry.Date - Time.Date).Days;
+
+        /// <summary>
         /// Gets the local date time this contract's data was last updated
         /// </summary>
         [PandasIgnore]
@@ -66,6 +72,27 @@ namespace QuantConnect.Data.Market
         /// Gets the last price this contract traded at
         /// </summary>
         public virtual decimal LastPrice { get; set; }
+
+        /// <summary>
+        /// Value representation of this contract, mimicking <see cref="BaseData.Value"/>.
+        /// Aliases <see cref="LastPrice"/>.
+        /// </summary>
+        [PandasIgnore]
+        public virtual decimal Value => LastPrice;
+
+        /// <summary>
+        /// Alias of value as price, mimicking <see cref="BaseData.Price"/>.
+        /// Aliases <see cref="LastPrice"/>.
+        /// </summary>
+        [PandasIgnore]
+        public virtual decimal Price => LastPrice;
+
+        /// <summary>
+        /// Closing price of this contract, mimicking <see cref="TradeBar.Close"/>.
+        /// Aliases <see cref="LastPrice"/>.
+        /// </summary>
+        [PandasIgnore]
+        public virtual decimal Close => LastPrice;
 
         /// <summary>
         /// Gets the last volume this contract traded at
